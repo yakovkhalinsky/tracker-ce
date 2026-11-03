@@ -855,6 +855,39 @@ class Sequencer
     void fillLinearVolume(int16_t fillStep, int16_t fromVal, int16_t toVal, int16_t density);
     void fillRandomVolume(int16_t fillStep, int16_t fromVal, int16_t toVal, int16_t density);
 
+    // Generative fill adapters (algorithms live in core/source/mtGenerators.*)
+    void fillWalkNotes(int16_t fillStep,
+                       int16_t scale,
+                       int16_t from,
+                       int16_t to,
+                       int16_t maxJump,
+                       int16_t density);
+    void fillTuringNotes(int16_t fillStep,
+                         int16_t scale,
+                         int16_t range,
+                         int16_t length,
+                         int16_t lock,
+                         int16_t density,
+                         uint16_t* reg,
+                         uint32_t* rngState,
+                         uint8_t* seeded);
+    void fillMarkovNotes(int16_t fillStep,
+                         int16_t scale,
+                         int16_t sourceMode,
+                         int16_t range,
+                         int16_t order,
+                         int16_t density);
+    void fillChanceFx(int16_t fxIndex,
+                      int16_t fillStep,
+                      int16_t chancePercent,
+                      int16_t maxWrites,
+                      int16_t density);
+    void fillRollFx(int16_t fxIndex,
+                    int16_t fillStep,
+                    int16_t probability,
+                    int16_t period,
+                    int16_t density);
+
     bool isEuclideanStep(uint8_t offset, int16_t density);
 
     bool isStepToFillNote(strPattern::strTrack::strStep* step,

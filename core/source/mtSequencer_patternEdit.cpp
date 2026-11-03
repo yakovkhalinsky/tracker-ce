@@ -2,12 +2,21 @@
 #include "fileManager.h"
 #include "mtAudioEngine.h"
 #include "mtSequencer.h"
+#include "mtGenerators.h"
 #include "mtStructs.h"
 #include "patternEditor/patternEditor.h"
 
 #include "ctype.h"
 #include "util_math.h"
 #include <cr_section_macros.h>
+
+// The host-testable bounds in mtGenerators.h must match the real FX ranges.
+static_assert(mtGen::kChanceProbMax == Sequencer::strFxConsts::CHANCE_PROB_MAX,
+              "Chance probability range changed");
+static_assert(mtGen::kRollPeriodMin == Sequencer::strFxConsts::ROLL_PERIOD_1_1,
+              "Roll period minimum changed");
+static_assert(mtGen::kRollPeriodMax == Sequencer::strFxConsts::ROLL_PERIOD_MAX,
+              "Roll period maximum changed");
 
 extern Sequencer sequencer;
 
@@ -403,6 +412,273 @@ void Sequencer::fillRandomVolume(int16_t fillStep,
             {
                 step->volume = clamp<int>(utilMathRandom::random(fromVal, toVal + 1), 0, 100);
             }
+        }
+    }
+}
+
+//----------------------------------------------------------------------------
+// Generative fills: thin adapters around core/source/mtGenerators.*
+//----------------------------------------------------------------------------
+static inline uint16_t fillScaleMask(int16_t scale)
+{
+    scale = clamp<int>(scale, 0, MAX_SCALE);
+    return scaleDef[scale];
+}
+
+static inline void fillNoteRange(int16_t range, uint8_t root, int& lo, int& hi)
+{
+    if (range < 1)
+        range = 24;
+    lo = clamp<int>(root, 0, 127);
+    hi = clamp<int>(lo + range, lo, 127);
+}
+
+void Sequencer::fillWalkNotes(int16_t fillStep,
+                              int16_t scale,
+                              int16_t from,
+                              int16_t to,
+                              int16_t maxJump,
+                              int16_t density)
+{
+    fromToSwap(from, to);
+
+    strSelection* sel = &selection;
+    if (!isSelectionCorrect(sel))
+        return;
+
+    const uint8_t root = mtProject.values.padBoardRootNote;
+    const uint16_t mask = fillScaleMask(scale);
+    const uint32_t baseSeed = (uint32_t)utilMathRandom::random();
+
+    for (uint8_t t = sel->firstTrack; t <= sel->lastTrack; t++)
+    {
+        mtGen::WalkState walk;
+        mtGen::walkInit(walk, baseSeed + (uint32_t)t * 0x9E3779B9u);
+
+        for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
+        {
+            strPattern::strTrack::strStep* step = &currentPattern->track[t].step[s];
+            if (!isStepToFillNote(step, offset, fillStep, density))
+                continue;
+
+            const int note = mtGen::walkNext(walk, from, to, maxJump, root, mask);
+
+            if (step->note == STEP_NOTE_EMPTY)
+            {
+                step->instrument = changeInstrumentInSpecificOrder(
+                  mtProject.values.lastUsedInstrument, 0, !isSampleTrack(t));
+            }
+            step->note = (int8_t)note;
+        }
+    }
+}
+
+void Sequencer::fillTuringNotes(int16_t fillStep,
+                                int16_t scale,
+                                int16_t range,
+                                int16_t length,
+                                int16_t lock,
+                                int16_t density,
+                                uint16_t* reg,
+                                uint32_t* rngState,
+                                uint8_t* seeded)
+{
+    strSelection* sel = &selection;
+    if (!isSelectionCorrect(sel) || reg == nullptr || rngState == nullptr || seeded == nullptr)
+        return;
+
+    const uint8_t root = mtProject.values.padBoardRootNote;
+    const uint16_t mask = fillScaleMask(scale);
+
+    int lo = 0;
+    int hi = 0;
+    fillNoteRange(range, root, lo, hi);
+
+    mtGen::TuringState state;
+    state.length = (uint8_t)clamp<int>(length, 1, mtGen::kMaxRegisterLength);
+
+    if (!*seeded)
+    {
+        mtGen::turingSeed(state, state.length, (uint32_t)utilMathRandom::random());
+    }
+    else
+    {
+        state.rng.state = *rngState;
+        state.reg = *reg;
+        state.seeded = true;
+
+        // Length may have changed since the last run.
+        const uint32_t maskBits = (1u << state.length) - 1u;
+        state.reg = (uint16_t)(state.reg & maskBits);
+        if (state.reg == 0)
+            state.reg = 1;
+    }
+
+    for (uint8_t t = sel->firstTrack; t <= sel->lastTrack; t++)
+    {
+        for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
+        {
+            strPattern::strTrack::strStep* step = &currentPattern->track[t].step[s];
+            if (!isStepToFillNote(step, offset, fillStep, density))
+                continue;
+
+            const int note = mtGen::turingNext(state, lo, hi, lock, root, mask);
+
+            if (step->note == STEP_NOTE_EMPTY)
+            {
+                step->instrument = changeInstrumentInSpecificOrder(
+                  mtProject.values.lastUsedInstrument, 0, !isSampleTrack(t));
+            }
+            step->note = (int8_t)note;
+        }
+    }
+
+    *reg = state.reg;
+    *rngState = state.rng.state;
+    *seeded = 1;
+}
+
+void Sequencer::fillMarkovNotes(int16_t fillStep,
+                                int16_t scale,
+                                int16_t sourceMode,
+                                int16_t range,
+                                int16_t order,
+                                int16_t density)
+{
+    strSelection* sel = &selection;
+    if (!isSelectionCorrect(sel))
+        return;
+
+    const uint8_t root = mtProject.values.padBoardRootNote;
+    const uint16_t mask = fillScaleMask(scale);
+
+    int lo = 0;
+    int hi = 0;
+    fillNoteRange(range, root, lo, hi);
+
+    int8_t source[mtGen::kMaxSteps];
+    int8_t out[mtGen::kMaxSteps];
+
+    for (uint8_t t = sel->firstTrack; t <= sel->lastTrack; t++)
+    {
+        int sourceLen = 0;
+        if (sourceMode == 1) // whole track
+        {
+            int length = currentPattern->track[t].length + 1;
+            length = clamp<int>(length, 0, mtGen::kMaxSteps);
+            for (int i = 0; i < length; i++)
+                source[sourceLen++] = currentPattern->track[t].step[i].note;
+        }
+        else // selected steps
+        {
+            for (uint8_t s = sel->firstStep; s <= sel->lastStep; s++)
+                source[sourceLen++] = currentPattern->track[t].step[s].note;
+        }
+
+        int outCount = 0;
+        uint8_t selected[mtGen::kMaxSteps];
+        for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
+        {
+            if (isStepToFillNote(&currentPattern->track[t].step[s], offset, fillStep, density))
+            {
+                if (outCount < mtGen::kMaxSteps)
+                    selected[outCount] = s;
+                outCount++;
+            }
+        }
+        if (outCount <= 0)
+            continue;
+        if (outCount > mtGen::kMaxSteps)
+            outCount = mtGen::kMaxSteps;
+
+        const int produced = mtGen::markovGenerate(source,
+                                                   sourceLen,
+                                                   order,
+                                                   outCount,
+                                                   lo,
+                                                   hi,
+                                                   root,
+                                                   mask,
+                                                   (uint32_t)utilMathRandom::random(),
+                                                   out);
+        if (produced <= 0)
+            continue;
+
+        for (int idx = 0; idx < produced; idx++)
+        {
+            strPattern::strTrack::strStep* step = &currentPattern->track[t].step[selected[idx]];
+
+            if (step->note == STEP_NOTE_EMPTY)
+            {
+                step->instrument = changeInstrumentInSpecificOrder(
+                  mtProject.values.lastUsedInstrument, 0, !isSampleTrack(t));
+            }
+            step->note = out[idx];
+        }
+    }
+}
+
+void Sequencer::fillChanceFx(int16_t fxIndex,
+                             int16_t fillStep,
+                             int16_t chancePercent,
+                             int16_t maxWrites,
+                             int16_t density)
+{
+    strSelection* sel = &selection;
+    if (!isSelectionCorrect(sel))
+        return;
+    if (fxIndex > FX_SLOTS_MAX)
+        fxIndex = 0;
+
+    const int16_t value = clamp<int>(chancePercent, 0, fx.CHANCE_PROB_MAX);
+    int written = 0;
+
+    for (uint8_t t = sel->firstTrack; t <= sel->lastTrack; t++)
+    {
+        for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
+        {
+            strPattern::strTrack::strStep* step = &currentPattern->track[t].step[s];
+            if (!isStepToFillFx(step, offset, fxIndex, fillStep, density))
+                continue;
+
+            if (maxWrites > 0 && written >= maxWrites)
+                return;
+
+            step->fx[fxIndex].type = fx.FX_TYPE_CHANCE;
+            step->fx[fxIndex].value = (uint8_t)value;
+            written++;
+        }
+    }
+}
+
+void Sequencer::fillRollFx(int16_t fxIndex,
+                           int16_t fillStep,
+                           int16_t probability,
+                           int16_t period,
+                           int16_t density)
+{
+    strSelection* sel = &selection;
+    if (!isSelectionCorrect(sel))
+        return;
+    if (fxIndex > FX_SLOTS_MAX)
+        fxIndex = 0;
+
+    const int16_t value = clamp<int>(period, fx.ROLL_PERIOD_1_1, fx.ROLL_PERIOD_MAX);
+    const int16_t prob = clamp<int>(probability, 0, 100);
+
+    for (uint8_t t = sel->firstTrack; t <= sel->lastTrack; t++)
+    {
+        for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
+        {
+            strPattern::strTrack::strStep* step = &currentPattern->track[t].step[s];
+            if (!isStepToFillFx(step, offset, fxIndex, fillStep, density))
+                continue;
+
+            if (prob < 100 && (int)utilMathRandom::random(0, 100) >= prob)
+                continue;
+
+            step->fx[fxIndex].type = fx.FX_TYPE_ROLL;
+            step->fx[fxIndex].value = (uint8_t)value;
         }
     }
 }
