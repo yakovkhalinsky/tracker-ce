@@ -469,10 +469,77 @@ bool cPatternEditor::fillStepUsesDensity(int16_t fillStep) const
     return fillStep >= Sequencer::fillStepRandom;
 }
 
+bool cPatternEditor::fillAltIsRotate(const strFill& fill) const
+{
+    return fillAltActive == fillAltRotate && fill.fillStep == Sequencer::fillStepEuclidean;
+}
+
+bool cPatternEditor::fillAltIsTypeParam(const strFill& fill) const
+{
+    if (!fillTypeHasAlt(fill.type))
+        return false;
+
+    // Without a density selector there is nothing to toggle to, so the type
+    // parameter is always the value shown in this slot.
+    return !fillStepUsesDensity(fill.fillStep) || fillAltActive == fillAltTypeParam;
+}
+
 bool cPatternEditor::fillAltSlotActive(const strFill& fill) const
 {
-    return fillTypeHasAlt(fill.type) &&
-           (!fillStepUsesDensity(fill.fillStep) || fillAltActive != 0);
+    if (!fillStepUsesDensity(fill.fillStep))
+        return fillTypeHasAlt(fill.type);
+    return fillAltIsRotate(fill) || fillAltIsTypeParam(fill);
+}
+
+int16_t cPatternEditor::fillRotateMax() const
+{
+    int length = (int)sequencer.selection.lastStep - (int)sequencer.selection.firstStep + 1;
+    if (length < 1)
+        length = 1;
+    return (int16_t)(length - 1);
+}
+
+int16_t cPatternEditor::fillDensityMax(int16_t fillStep) const
+{
+    if (fillStep == Sequencer::fillStepEuclidean)
+        return (int16_t)clamp<int>(fillRotateMax() + 1, 1, Sequencer::MAX_FILL_DENSITY);
+    return Sequencer::MAX_FILL_DENSITY;
+}
+
+int16_t* cPatternEditor::fillAltValuePtr(strFill& fill, int16_t& min, int16_t& max) const
+{
+    if (fillAltIsRotate(fill))
+    {
+        min = 0;
+        max = fillRotateMax();
+        return &fill.rotate;
+    }
+
+    const int16_t type = fill.type;
+    min = fillAltMin(type);
+    max = fillAltMax(type);
+    return &fill.genParam[type - fillTypeWalk][3];
+}
+
+void cPatternEditor::toggleFillAlt(const strFill& fill)
+{
+    if (!fillStepUsesDensity(fill.fillStep))
+        return;
+
+    // Cycle through Density/Events, Euclidean Rotate and the type's alternate
+    // parameter, skipping the modes that are not available for this
+    // combination.  The second column always shows the selected mode's name.
+    for (uint8_t i = 1; i <= 3; i++)
+    {
+        const uint8_t mode = (uint8_t)((fillAltActive + i) % 3);
+        if (mode == fillAltDensity ||
+            (mode == fillAltRotate && fill.fillStep == Sequencer::fillStepEuclidean) ||
+            (mode == fillAltTypeParam && fillTypeHasAlt(fill.type)))
+        {
+            fillAltActive = mode;
+            return;
+        }
+    }
 }
 
 int16_t cPatternEditor::fillAltMin(int16_t type) const
@@ -889,6 +956,11 @@ void cPatternEditor::showFillFx()
 void cPatternEditor::showFillPopup()
 {
     uint8_t fillIdx = getFillDataIdx();
+
+    // Density selectors always open on Events; the alternate values (Rotate /
+    // Max jump / Range) are one press of the second column away.
+    if (fillStepUsesDensity(fillData[fillIdx].fillStep))
+        fillAltActive = fillAltDensity;
 
     if (fillData[fillIdx].type == 0)
     {
@@ -1382,17 +1454,19 @@ void cPatternEditor::refreshFillParam()
 void cPatternEditor::refreshFillDensity()
 {
     uint8_t fillIdx = getFillDataIdx();
-    const strFill& fill = fillData[fillIdx];
+    strFill& fill = fillData[fillIdx];
 
     if (fillAltSlotActive(fill))
     {
-        int16_t type = fill.type;
-        int16_t min = fillAltMin(type);
-        int16_t max = fillAltMax(type);
-        int16_t value = clamp<int>(fill.genParam[type - fillTypeWalk][3], min, max);
+        int16_t min = 0;
+        int16_t max = 0;
+        int16_t* stored = fillAltValuePtr(fill, min, max);
+        int16_t value = clamp<int>(*stored, min, max);
+        *stored = value;
 
         sprintf(fillTextDensity, "%d", value);
-        display.setControlText(label[1], fillAltLabel(type));
+        display.setControlText(label[1],
+                               fillAltIsRotate(fill) ? "Rotate" : fillAltLabel(fill.type));
         display.setControlText2(label[1], fillTextDensity);
         display.refreshControl(label[1]);
         display.setControlValue(val3PopupBar, max > min ? (value - min) * 100 / (max - min) : 0);
@@ -1401,7 +1475,7 @@ void cPatternEditor::refreshFillDensity()
     }
 
     const char* labelText = nullptr;
-    int value;
+    int value = 0;
     switch (fill.fillStep)
     {
         case Sequencer::fillStepRandom:
@@ -1415,10 +1489,16 @@ void cPatternEditor::refreshFillDensity()
             sprintf(fillTextDensity, "%d", fill.density[fill.fillStep]);
             break;
         case Sequencer::fillStepEuclidean:
+        {
             labelText = "Events";
-            value = fill.density[fill.fillStep] * 100 / Sequencer::MAX_FILL_DENSITY;
+            const int maxEvents = fillDensityMax(fill.fillStep);
+            fill.density[fill.fillStep] =
+              clamp<int>(fill.density[fill.fillStep], 1, maxEvents);
+            value = maxEvents > 1 ? (fill.density[fill.fillStep] - 1) * 100 / (maxEvents - 1)
+                                  : 100;
             sprintf(fillTextDensity, "%d", fill.density[fill.fillStep]);
             break;
+        }
         default: break;
     }
     if (labelText != nullptr)

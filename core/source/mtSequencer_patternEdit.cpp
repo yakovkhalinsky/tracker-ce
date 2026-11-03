@@ -17,6 +17,12 @@ static_assert(mtGen::kRollPeriodMin == Sequencer::strFxConsts::ROLL_PERIOD_1_1,
               "Roll period minimum changed");
 static_assert(mtGen::kRollPeriodMax == Sequencer::strFxConsts::ROLL_PERIOD_MAX,
               "Roll period maximum changed");
+static_assert(mtGen::kSampleInstrumentCount == kSampleInstrumentsCount,
+              "Sample instrument count changed");
+static_assert(mtGen::kMidiInstrumentStart == MIDI_INSTRUMENTS_START_IDX,
+              "MIDI instrument start changed");
+static_assert(mtGen::kSynthInstrumentStart == SYNTH_INSTRUMENTS_START_IDX,
+              "Synth instrument start changed");
 
 extern Sequencer sequencer;
 
@@ -37,7 +43,8 @@ void Sequencer::fillRandomNotes(int16_t fillStep,
                                 int16_t scale,
                                 int16_t from,
                                 int16_t to,
-                                int16_t density)
+                                int16_t density,
+                                int16_t rotate)
 {
     fromToSwap(from, to);
 
@@ -49,15 +56,15 @@ void Sequencer::fillRandomNotes(int16_t fillStep,
 
     for (uint8_t t = sel->firstTrack; t <= sel->lastTrack; t++)
     {
+        const uint8_t fillInstrument = getFillInstrumentForTrack(t);
         for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
         {
             step = &currentPattern->track[t].step[s];
-            if (isStepToFillNote(step, offset, fillStep, density))
+            if (isStepToFillNote(step, offset, fillStep, density, rotate))
             {
                 if (step->note == STEP_NOTE_EMPTY)
                 {
-                    step->instrument = changeInstrumentInSpecificOrder(
-                      mtProject.values.lastUsedInstrument, 0, !isSampleTrack(t));
+                    step->instrument = fillInstrument;
                 }
                 for (uint8_t a = 0; a <= 100; a -= -1)
                 {
@@ -73,7 +80,8 @@ void Sequencer::fillLinearNotes(int16_t fillStep,
                                 int16_t scale,
                                 int16_t from,
                                 int16_t to,
-                                int16_t density)
+                                int16_t density,
+                                int16_t rotate)
 {
     strSelection* sel = &selection;
     if (!isSelectionCorrect(sel))
@@ -84,10 +92,11 @@ void Sequencer::fillLinearNotes(int16_t fillStep,
 
     for (uint8_t t = sel->firstTrack; t <= sel->lastTrack; t++)
     {
+        const uint8_t fillInstrument = getFillInstrumentForTrack(t);
         for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
         {
             step = &currentPattern->track[t].step[s];
-            if (isStepToFillNote(step, offset, fillStep, density))
+            if (isStepToFillNote(step, offset, fillStep, density, rotate))
             {
                 int newNote = round(mapClamped<float>(
                   (float)offset + sel->firstStep, sel->firstStep, sel->lastStep, from, to));
@@ -104,8 +113,7 @@ void Sequencer::fillLinearNotes(int16_t fillStep,
                 {
                     if (step->isNoteEmpty())
                     {
-                        step->instrument = changeInstrumentInSpecificOrder(
-                          mtProject.values.lastUsedInstrument, 0, !isSampleTrack(t));
+                        step->instrument = fillInstrument;
                     }
                     step->note = newNote;
                 }
@@ -113,7 +121,8 @@ void Sequencer::fillLinearNotes(int16_t fillStep,
         }
     }
 }
-void Sequencer::fillLinearInstruments(int16_t fillStep, int16_t from, int16_t to, int16_t density)
+void Sequencer::fillLinearInstruments(
+  int16_t fillStep, int16_t from, int16_t to, int16_t density, int16_t rotate)
 {
 
     strSelection* sel = &selection;
@@ -126,7 +135,7 @@ void Sequencer::fillLinearInstruments(int16_t fillStep, int16_t from, int16_t to
         for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
         {
             step = &currentPattern->track[t].step[s];
-            if (isStepToFillNote(step, offset, fillStep, density))
+            if (isStepToFillNote(step, offset, fillStep, density, rotate))
             {
                 int newInstrument =
                   mapClamped<int>(offset + sel->firstStep, sel->firstStep, sel->lastStep, from, to);
@@ -148,7 +157,8 @@ void Sequencer::fillLinearFx(int16_t fxIndex,
                              int16_t fxName,
                              int16_t fromVal,
                              int16_t toVal,
-                             int16_t density)
+                             int16_t density,
+                             int16_t rotate)
 {
     strSelection* sel = &selection;
     if (!isSelectionCorrect(sel))
@@ -169,7 +179,7 @@ void Sequencer::fillLinearFx(int16_t fxIndex,
         {
             step = &currentPattern->track[t].step[s];
 
-            if (isStepToFillFx(step, offset, fxIndex, fillStep, density))
+            if (isStepToFillFx(step, offset, fxIndex, fillStep, density, rotate))
             {
                 step->fx[fxIndex].type = (fxType >= 0) ? fxType : generateRandomFx();
 
@@ -209,7 +219,8 @@ void Sequencer::fillRandomFx(int16_t fxIndex,
                              int16_t fxName,
                              int16_t fromVal,
                              int16_t toVal,
-                             int16_t density)
+                             int16_t density,
+                             int16_t rotate)
 {
     fromToSwap(fromVal, toVal);
 
@@ -229,7 +240,7 @@ void Sequencer::fillRandomFx(int16_t fxIndex,
         {
             step = &currentPattern->track[t].step[s];
 
-            if (isStepToFillFx(step, offset, fxIndex, fillStep, density))
+            if (isStepToFillFx(step, offset, fxIndex, fillStep, density, rotate))
             {
                 step->fx[fxIndex].value = utilMathRandom::random(fromVal, toVal + 1);
                 step->fx[fxIndex].type = (fxType >= 0) ? fxType : generateRandomFx();
@@ -242,20 +253,18 @@ void Sequencer::fillRandomFx(int16_t fxIndex,
     }
 }
 
-bool Sequencer::isEuclideanStep(uint8_t offset, int16_t density)
+bool Sequencer::isEuclideanStep(uint8_t offset, int16_t density, int16_t rotate)
 {
-    int length = selection.lastStep - selection.firstStep + 1;
-    float euclStepSize = (float)length / density;
-    float nearestStep = round(offset / euclStepSize) * euclStepSize;
-    float diff = nearestStep - (float)offset;
-    return diff <= 0.5f && diff > -0.5f;
+    const int length = (int)selection.lastStep - (int)selection.firstStep + 1;
+    return mtGen::euclideanHit(offset, density, length, rotate);
 }
 
 bool Sequencer::isStepToFillFx(strPattern::strTrack::strStep* step,
                                uint8_t offset,
                                uint8_t fxIndex,
                                int16_t fillStep,
-                               int16_t density)
+                               int16_t density,
+                               int16_t rotate)
 {
     if (fillStep == fillStepByStep && offset % density == 0)
         return true;
@@ -264,7 +273,7 @@ bool Sequencer::isStepToFillFx(strPattern::strTrack::strStep* step,
 
     else if (fillStep == fillStepEuclidean)
     {
-        return isEuclideanStep(offset, density);
+        return isEuclideanStep(offset, density, rotate);
     }
 
     else if (fillStep == fillStepNoFx && step->fx[fxIndex].type == 0)
@@ -286,14 +295,15 @@ bool Sequencer::isStepToFillProp(strPattern::strTrack::strStep* step,
                                  uint8_t offset,
                                  bool isPropSet,
                                  int16_t fillStep,
-                                 int16_t density)
+                                 int16_t density,
+                                 int16_t rotate)
 {
     if (fillStep == fillStepByStep && offset % density == 0)
         return true;
     else if (fillStep == fillStepRandom && utilMathRandom::random(0, MAX_FILL_DENSITY) < density)
         return true;
     else if (fillStep == fillStepEuclidean)
-        return isEuclideanStep(offset, density);
+        return isEuclideanStep(offset, density, rotate);
     else if (fillStep == fillStepNoFx && !isPropSet)
         return true;
     else if (fillStep == fillStepFx && isPropSet)
@@ -309,7 +319,8 @@ bool Sequencer::isStepToFillProp(strPattern::strTrack::strStep* step,
 void Sequencer::fillLinearMicromove(int16_t fillStep,
                                     int16_t fromVal,
                                     int16_t toVal,
-                                    int16_t density)
+                                    int16_t density,
+                                    int16_t rotate)
 {
     strSelection* sel = &selection;
     if (!isSelectionCorrect(sel))
@@ -320,7 +331,7 @@ void Sequencer::fillLinearMicromove(int16_t fillStep,
         for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
         {
             strPattern::strTrack::strStep* step = &currentPattern->track[t].step[s];
-            if (isStepToFillProp(step, offset, step->micromove >= 0, fillStep, density))
+            if (isStepToFillProp(step, offset, step->micromove >= 0, fillStep, density, rotate))
             {
                 float tempFloat = fromVal;
                 if (sel->firstStep != sel->lastStep)
@@ -340,7 +351,8 @@ void Sequencer::fillLinearMicromove(int16_t fillStep,
 void Sequencer::fillRandomMicromove(int16_t fillStep,
                                     int16_t fromVal,
                                     int16_t toVal,
-                                    int16_t density)
+                                    int16_t density,
+                                    int16_t rotate)
 {
     fromToSwap(fromVal, toVal);
 
@@ -353,7 +365,7 @@ void Sequencer::fillRandomMicromove(int16_t fillStep,
         for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
         {
             strPattern::strTrack::strStep* step = &currentPattern->track[t].step[s];
-            if (isStepToFillProp(step, offset, step->micromove >= 0, fillStep, density))
+            if (isStepToFillProp(step, offset, step->micromove >= 0, fillStep, density, rotate))
             {
                 step->micromove = clamp<int>(utilMathRandom::random(fromVal, toVal + 1), 0, 100);
             }
@@ -364,7 +376,8 @@ void Sequencer::fillRandomMicromove(int16_t fillStep,
 void Sequencer::fillLinearVolume(int16_t fillStep,
                                  int16_t fromVal,
                                  int16_t toVal,
-                                 int16_t density)
+                                 int16_t density,
+                                 int16_t rotate)
 {
     strSelection* sel = &selection;
     if (!isSelectionCorrect(sel))
@@ -375,7 +388,7 @@ void Sequencer::fillLinearVolume(int16_t fillStep,
         for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
         {
             strPattern::strTrack::strStep* step = &currentPattern->track[t].step[s];
-            if (isStepToFillProp(step, offset, step->volume >= 0, fillStep, density))
+            if (isStepToFillProp(step, offset, step->volume >= 0, fillStep, density, rotate))
             {
                 float tempFloat = fromVal;
                 if (sel->firstStep != sel->lastStep)
@@ -395,7 +408,8 @@ void Sequencer::fillLinearVolume(int16_t fillStep,
 void Sequencer::fillRandomVolume(int16_t fillStep,
                                  int16_t fromVal,
                                  int16_t toVal,
-                                 int16_t density)
+                                 int16_t density,
+                                 int16_t rotate)
 {
     fromToSwap(fromVal, toVal);
 
@@ -408,7 +422,7 @@ void Sequencer::fillRandomVolume(int16_t fillStep,
         for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
         {
             strPattern::strTrack::strStep* step = &currentPattern->track[t].step[s];
-            if (isStepToFillProp(step, offset, step->volume >= 0, fillStep, density))
+            if (isStepToFillProp(step, offset, step->volume >= 0, fillStep, density, rotate))
             {
                 step->volume = clamp<int>(utilMathRandom::random(fromVal, toVal + 1), 0, 100);
             }
@@ -438,7 +452,8 @@ void Sequencer::fillWalkNotes(int16_t fillStep,
                               int16_t from,
                               int16_t to,
                               int16_t maxJump,
-                              int16_t density)
+                              int16_t density,
+                              int16_t rotate)
 {
     fromToSwap(from, to);
 
@@ -454,19 +469,19 @@ void Sequencer::fillWalkNotes(int16_t fillStep,
     {
         mtGen::WalkState walk;
         mtGen::walkInit(walk, baseSeed + (uint32_t)t * 0x9E3779B9u);
+        const uint8_t fillInstrument = getFillInstrumentForTrack(t);
 
         for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
         {
             strPattern::strTrack::strStep* step = &currentPattern->track[t].step[s];
-            if (!isStepToFillNote(step, offset, fillStep, density))
+            if (!isStepToFillNote(step, offset, fillStep, density, rotate))
                 continue;
 
             const int note = mtGen::walkNext(walk, from, to, maxJump, root, mask);
 
             if (step->note == STEP_NOTE_EMPTY)
             {
-                step->instrument = changeInstrumentInSpecificOrder(
-                  mtProject.values.lastUsedInstrument, 0, !isSampleTrack(t));
+                step->instrument = fillInstrument;
             }
             step->note = (int8_t)note;
         }
@@ -479,6 +494,7 @@ void Sequencer::fillTuringNotes(int16_t fillStep,
                                 int16_t length,
                                 int16_t lock,
                                 int16_t density,
+                                int16_t rotate,
                                 uint16_t* reg,
                                 uint32_t* rngState,
                                 uint8_t* seeded)
@@ -516,18 +532,18 @@ void Sequencer::fillTuringNotes(int16_t fillStep,
 
     for (uint8_t t = sel->firstTrack; t <= sel->lastTrack; t++)
     {
+        const uint8_t fillInstrument = getFillInstrumentForTrack(t);
         for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
         {
             strPattern::strTrack::strStep* step = &currentPattern->track[t].step[s];
-            if (!isStepToFillNote(step, offset, fillStep, density))
+            if (!isStepToFillNote(step, offset, fillStep, density, rotate))
                 continue;
 
             const int note = mtGen::turingNext(state, lo, hi, lock, root, mask);
 
             if (step->note == STEP_NOTE_EMPTY)
             {
-                step->instrument = changeInstrumentInSpecificOrder(
-                  mtProject.values.lastUsedInstrument, 0, !isSampleTrack(t));
+                step->instrument = fillInstrument;
             }
             step->note = (int8_t)note;
         }
@@ -543,7 +559,8 @@ void Sequencer::fillMarkovNotes(int16_t fillStep,
                                 int16_t sourceMode,
                                 int16_t range,
                                 int16_t order,
-                                int16_t density)
+                                int16_t density,
+                                int16_t rotate)
 {
     strSelection* sel = &selection;
     if (!isSelectionCorrect(sel))
@@ -561,6 +578,7 @@ void Sequencer::fillMarkovNotes(int16_t fillStep,
 
     for (uint8_t t = sel->firstTrack; t <= sel->lastTrack; t++)
     {
+        const uint8_t fillInstrument = getFillInstrumentForTrack(t);
         int sourceLen = 0;
         if (sourceMode == 1) // whole track
         {
@@ -579,7 +597,8 @@ void Sequencer::fillMarkovNotes(int16_t fillStep,
         uint8_t selected[mtGen::kMaxSteps];
         for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
         {
-            if (isStepToFillNote(&currentPattern->track[t].step[s], offset, fillStep, density))
+            if (isStepToFillNote(
+                  &currentPattern->track[t].step[s], offset, fillStep, density, rotate))
             {
                 if (outCount < mtGen::kMaxSteps)
                     selected[outCount] = s;
@@ -610,8 +629,7 @@ void Sequencer::fillMarkovNotes(int16_t fillStep,
 
             if (step->note == STEP_NOTE_EMPTY)
             {
-                step->instrument = changeInstrumentInSpecificOrder(
-                  mtProject.values.lastUsedInstrument, 0, !isSampleTrack(t));
+                step->instrument = fillInstrument;
             }
             step->note = out[idx];
         }
@@ -622,7 +640,8 @@ void Sequencer::fillChanceFx(int16_t fxIndex,
                              int16_t fillStep,
                              int16_t chancePercent,
                              int16_t maxWrites,
-                             int16_t density)
+                             int16_t density,
+                             int16_t rotate)
 {
     strSelection* sel = &selection;
     if (!isSelectionCorrect(sel))
@@ -638,7 +657,7 @@ void Sequencer::fillChanceFx(int16_t fxIndex,
         for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
         {
             strPattern::strTrack::strStep* step = &currentPattern->track[t].step[s];
-            if (!isStepToFillFx(step, offset, fxIndex, fillStep, density))
+            if (!isStepToFillFx(step, offset, fxIndex, fillStep, density, rotate))
                 continue;
 
             if (maxWrites > 0 && written >= maxWrites)
@@ -655,7 +674,8 @@ void Sequencer::fillRollFx(int16_t fxIndex,
                            int16_t fillStep,
                            int16_t probability,
                            int16_t period,
-                           int16_t density)
+                           int16_t density,
+                           int16_t rotate)
 {
     strSelection* sel = &selection;
     if (!isSelectionCorrect(sel))
@@ -671,7 +691,7 @@ void Sequencer::fillRollFx(int16_t fxIndex,
         for (uint8_t s = sel->firstStep, offset = 0; s <= sel->lastStep; s++, offset++)
         {
             strPattern::strTrack::strStep* step = &currentPattern->track[t].step[s];
-            if (!isStepToFillFx(step, offset, fxIndex, fillStep, density))
+            if (!isStepToFillFx(step, offset, fxIndex, fillStep, density, rotate))
                 continue;
 
             if (prob < 100 && (int)utilMathRandom::random(0, 100) >= prob)
@@ -686,7 +706,8 @@ void Sequencer::fillRollFx(int16_t fxIndex,
 bool Sequencer::isStepToFillNote(strPattern::strTrack::strStep* step,
                                  uint8_t offset,
                                  int16_t fillStep,
-                                 int16_t density)
+                                 int16_t density,
+                                 int16_t rotate)
 {
     if (fillStep == fillStepByStep && offset % density == 0)
         return true;
@@ -695,7 +716,7 @@ bool Sequencer::isStepToFillNote(strPattern::strTrack::strStep* step,
 
     else if (fillStep == fillStepEuclidean)
     {
-        return isEuclideanStep(offset, density);
+        return isEuclideanStep(offset, density, rotate);
     }
 
     else if (fillStep == fillStepNoFx && step->fx[0].type == 0 && step->fx[1].type == 0)
@@ -713,7 +734,8 @@ bool Sequencer::isStepToFillNote(strPattern::strTrack::strStep* step,
     return false;
 }
 
-void Sequencer::fillRandomInstruments(int16_t fillStep, int16_t from, int16_t to, int16_t density)
+void Sequencer::fillRandomInstruments(
+  int16_t fillStep, int16_t from, int16_t to, int16_t density, int16_t rotate)
 {
     fromToSwap(from, to);
 
@@ -728,7 +750,7 @@ void Sequencer::fillRandomInstruments(int16_t fillStep, int16_t from, int16_t to
         {
             step = &currentPattern->track[t].step[s];
 
-            if (isStepToFillNote(step, offset, fillStep, density))
+            if (isStepToFillNote(step, offset, fillStep, density, rotate))
             {
                 int newInstrument = utilMathRandom::random(from, to + 1);
                 step->instrument =
@@ -743,9 +765,23 @@ void Sequencer::fillRandomInstruments(int16_t fillStep, int16_t from, int16_t to
     }
 }
 
+uint8_t Sequencer::getFillInstrumentForTrack(uint8_t track)
+{
+    if (isSampleTrack(track))
+        return changeInstrumentInSpecificOrder(mtProject.values.lastUsedInstrument, 0, false);
+
+    uint8_t instruments[mtGen::kMaxSteps];
+    const int count = clamp<int>(currentPattern->track[track].length + 1, 0, mtGen::kMaxSteps);
+    for (int i = 0; i < count; i++)
+        instruments[i] = currentPattern->track[track].step[i].instrument;
+
+    const uint8_t fallback =
+      changeInstrumentInSpecificOrder(mtProject.values.lastUsedInstrument, 0, true);
+    return (uint8_t)mtGen::pickTrackFillInstrument(instruments, count, fallback);
+}
+
 void Sequencer::invertSelectedSteps(uint8_t elements)
 {
-
     strSelection* sel = &selection;
     if (!isSelectionCorrect(sel))
         return;

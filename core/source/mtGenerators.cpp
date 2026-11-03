@@ -433,6 +433,52 @@ int markovGenerate(const int8_t* source,
 }
 
 //----------------------------------------------------------------------------
+// Step selectors
+//----------------------------------------------------------------------------
+bool euclideanHit(int offset, int density, int length, int rotate)
+{
+    if (length < 1 || density < 1)
+        return false;
+
+    if (density > length)
+        density = length;
+
+    int shift = rotate % length;
+    if (shift < 0)
+        shift += length;
+
+    int position = (offset + shift) % length;
+    if (position < 0)
+        position += length;
+
+    return ((position * density) % length) < density;
+}
+
+int pickTrackFillInstrument(const uint8_t* instruments, int count, int fallbackInstrument)
+{
+    if (instruments == nullptr || count <= 0)
+        return fallbackInstrument;
+
+    int lastMidi = -1;
+    int lastSynth = -1;
+
+    for (int i = 0; i < count; i++)
+    {
+        const int instrument = instruments[i];
+        if (instrument >= kSynthInstrumentStart)
+            lastSynth = instrument;
+        else if (instrument >= kMidiInstrumentStart)
+            lastMidi = instrument;
+    }
+
+    if (lastSynth >= 0)
+        return lastSynth;
+    if (lastMidi >= 0)
+        return lastMidi;
+    return fallbackInstrument;
+}
+
+//----------------------------------------------------------------------------
 // Prob / Ratchet value mapping
 //----------------------------------------------------------------------------
 int chanceFromPercent(int percent)

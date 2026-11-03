@@ -1561,6 +1561,17 @@ void cPatternEditor::changeFillData(int16_t value, bool rollListOver)
             next = rollListOver ? Sequencer::fillStepNote : Sequencer::fillStepEnd__ - 1;
         fill.fillStep = next;
 
+        // Density selectors (Euclidean / Each / Random) always show Events
+        // first when the step mode changes.
+        fillAltActive = fillAltDensity;
+
+        if (fill.fillStep == Sequencer::fillStepEuclidean)
+        {
+            fill.density[fill.fillStep] =
+              clamp<int>(fill.density[fill.fillStep], 1, fillDensityMax(fill.fillStep));
+            fill.rotate = clamp<int>(fill.rotate, 0, fillRotateMax());
+        }
+
         if (!isFillPlaceValid(fillPlace))
             fillPlace = 0;
 
@@ -1595,12 +1606,12 @@ void cPatternEditor::changeFillData(int16_t value, bool rollListOver)
     {
         if (fillAltSlotActive(fill))
         {
-            int16_t min = fillAltMin(fill.type);
-            int16_t max = fillAltMax(fill.type);
-            int16_t* ptr = &fill.genParam[fill.type - fillTypeWalk][3];
+            int16_t min = 0;
+            int16_t max = 0;
+            int16_t* ptr = fillAltValuePtr(fill, min, max);
             int16_t next = *ptr + value;
             if (next < min)
-                next = min;
+                next = rollListOver ? max : min;
             else if (next > max)
                 next = rollListOver ? min : max;
             *ptr = next;
@@ -1609,11 +1620,12 @@ void cPatternEditor::changeFillData(int16_t value, bool rollListOver)
         }
 
         int16_t* ptr = &fill.density[fill.fillStep];
+        int16_t max = fillDensityMax(fill.fillStep);
         int16_t next = *ptr + value;
         if (next < 1)
-            next = 1;
-        else if (next > Sequencer::MAX_FILL_DENSITY)
-            next = rollListOver ? 1 : Sequencer::MAX_FILL_DENSITY;
+            next = rollListOver ? max : 1;
+        else if (next > max)
+            next = rollListOver ? 1 : max;
         *ptr = next;
         refreshFillDensity();
         return;
@@ -1665,6 +1677,15 @@ void cPatternEditor::changneFillDataByPad(uint8_t pad)
         {
             if (pad < Sequencer::fillStepEnd__)
                 fill.fillStep = pad;
+
+            fillAltActive = fillAltDensity;
+            if (fill.fillStep == Sequencer::fillStepEuclidean)
+            {
+                fill.density[fill.fillStep] =
+                  clamp<int>(fill.density[fill.fillStep], 1, fillDensityMax(fill.fillStep));
+                fill.rotate = clamp<int>(fill.rotate, 0, fillRotateMax());
+            }
+
             if (!isFillPlaceValid(fillPlace))
                 fillPlace = 0;
             refreshFillStep();
@@ -1674,16 +1695,16 @@ void cPatternEditor::changneFillDataByPad(uint8_t pad)
         {
             if (fillAltSlotActive(fill))
             {
-                int16_t min = fillAltMin(fill.type);
-                int16_t max = fillAltMax(fill.type);
-                fill.genParam[fill.type - fillTypeWalk][3] =
-                  mapClamped<int>(pad, 0, 47, min, max);
+                int16_t min = 0;
+                int16_t max = 0;
+                int16_t* ptr = fillAltValuePtr(fill, min, max);
+                *ptr = mapClamped<int>(pad, 0, 47, min, max);
                 refreshFillDensity();
             }
             else
             {
                 fill.density[fill.fillStep] =
-                  mapClamped<int>(pad, 0, 47, 1, Sequencer::MAX_FILL_DENSITY);
+                  mapClamped<int>(pad, 0, 47, 1, fillDensityMax(fill.fillStep));
                 refreshFillDensity();
             }
             break;
@@ -1773,17 +1794,20 @@ void cPatternEditor::changeFillDataByActionButton(uint8_t place)
     if (place > 5)
         return;
 
-    // Slot 1 carries two settings for Walk / Turing / Markov: the step
-    // density and the type's alternate parameter (Max jump / Range).  While
-    // the step selector uses density, pressing the slot button again toggles
-    // between them; +/- keeps editing the value that is shown.
+    // The second column can carry more than one setting while a density
+    // selector (Euclidean / Each / Random) is active: the Events count, the
+    // Euclidean Rotate, and (for Walk / Turing / Markov) the type's alternate
+    // parameter.  Pressing the slot button cycles through the available ones;
+    // +/- keeps editing the value that is currently shown.
     if (place == 1 && fillPlace == 1)
     {
         uint8_t fillIdx = getFillDataIdx();
         strFill& fill = fillData[fillIdx];
-        if (fillTypeHasAlt(fill.type) && fillStepUsesDensity(fill.fillStep))
+        const bool hasRotate = fill.fillStep == Sequencer::fillStepEuclidean;
+        const bool hasTypeAlt = fillTypeHasAlt(fill.type);
+        if (fillStepUsesDensity(fill.fillStep) && (hasRotate || hasTypeAlt))
         {
-            fillAltActive = fillAltActive ? 0 : 1;
+            toggleFillAlt(fill);
             refreshFillDensity();
             return;
         }
@@ -3511,6 +3535,7 @@ static void applyFill(cPatternEditor::strFill* fillData, uint8_t editParam, bool
 {
     const int16_t type = fillData->type;
     const int16_t density = fillData->density[fillData->fillStep];
+    const int16_t rotate = fillData->rotate;
     const int gi = type - cPatternEditor::fillTypeWalk;
 
     switch (editParam)
@@ -3523,21 +3548,24 @@ static void applyFill(cPatternEditor::strFill* fillData, uint8_t editParam, bool
                                               fillData->param,
                                               fillData->from,
                                               fillData->from,
-                                              density);
+                                              density,
+                                              rotate);
                     break;
                 case cPatternEditor::fillTypeFromTo:
                     sequencer.fillLinearNotes(fillData->fillStep,
                                               fillData->param,
                                               fillData->from,
                                               fillData->to,
-                                              density);
+                                              density,
+                                              rotate);
                     break;
                 case cPatternEditor::fillTypeRandom:
                     sequencer.fillRandomNotes(fillData->fillStep,
                                               fillData->param,
                                               fillData->from,
                                               fillData->to,
-                                              density);
+                                              density,
+                                              rotate);
                     break;
                 case cPatternEditor::fillTypeWalk:
                     sequencer.fillWalkNotes(fillData->fillStep,
@@ -3545,7 +3573,8 @@ static void applyFill(cPatternEditor::strFill* fillData, uint8_t editParam, bool
                                             fillData->genParam[gi][1],
                                             fillData->genParam[gi][2],
                                             fillData->genParam[gi][3],
-                                            density);
+                                            density,
+                                            rotate);
                     break;
                 case cPatternEditor::fillTypeTuring:
                     sequencer.fillTuringNotes(fillData->fillStep,
@@ -3554,6 +3583,7 @@ static void applyFill(cPatternEditor::strFill* fillData, uint8_t editParam, bool
                                               fillData->genParam[gi][1],
                                               fillData->genParam[gi][2],
                                               density,
+                                              rotate,
                                               &fillData->turingReg,
                                               &fillData->turingRng,
                                               &fillData->turingSeeded);
@@ -3564,7 +3594,8 @@ static void applyFill(cPatternEditor::strFill* fillData, uint8_t editParam, bool
                                               fillData->genParam[gi][1],
                                               fillData->genParam[gi][3],
                                               fillData->genParam[gi][2],
-                                              density);
+                                              density,
+                                              rotate);
                     break;
                 default: break;
             }
@@ -3574,17 +3605,17 @@ static void applyFill(cPatternEditor::strFill* fillData, uint8_t editParam, bool
             if (type == cPatternEditor::fillTypeConstant)
             {
                 sequencer.fillLinearInstruments(
-                  fillData->fillStep, fillData->from, fillData->from, density);
+                  fillData->fillStep, fillData->from, fillData->from, density, rotate);
             }
             else if (type == cPatternEditor::fillTypeFromTo)
             {
                 sequencer.fillLinearInstruments(
-                  fillData->fillStep, fillData->from, fillData->to, density);
+                  fillData->fillStep, fillData->from, fillData->to, density, rotate);
             }
             else if (type == cPatternEditor::fillTypeRandom)
             {
                 sequencer.fillRandomInstruments(
-                  fillData->fillStep, fillData->from, fillData->to, density);
+                  fillData->fillStep, fillData->from, fillData->to, density, rotate);
             }
             break;
 
@@ -3596,25 +3627,25 @@ static void applyFill(cPatternEditor::strFill* fillData, uint8_t editParam, bool
                 {
                     if (type == cPatternEditor::fillTypeConstant)
                         sequencer.fillLinearMicromove(
-                          fillData->fillStep, fillData->from, fillData->from, density);
+                          fillData->fillStep, fillData->from, fillData->from, density, rotate);
                     else if (type == cPatternEditor::fillTypeFromTo)
                         sequencer.fillLinearMicromove(
-                          fillData->fillStep, fillData->from, fillData->to, density);
+                          fillData->fillStep, fillData->from, fillData->to, density, rotate);
                     else if (type == cPatternEditor::fillTypeRandom)
                         sequencer.fillRandomMicromove(
-                          fillData->fillStep, fillData->from, fillData->to, density);
+                          fillData->fillStep, fillData->from, fillData->to, density, rotate);
                 }
                 else
                 {
                     if (type == cPatternEditor::fillTypeConstant)
                         sequencer.fillLinearVolume(
-                          fillData->fillStep, fillData->from, fillData->from, density);
+                          fillData->fillStep, fillData->from, fillData->from, density, rotate);
                     else if (type == cPatternEditor::fillTypeFromTo)
                         sequencer.fillLinearVolume(
-                          fillData->fillStep, fillData->from, fillData->to, density);
+                          fillData->fillStep, fillData->from, fillData->to, density, rotate);
                     else if (type == cPatternEditor::fillTypeRandom)
                         sequencer.fillRandomVolume(
-                          fillData->fillStep, fillData->from, fillData->to, density);
+                          fillData->fillStep, fillData->from, fillData->to, density, rotate);
                 }
                 break;
             }
@@ -3630,7 +3661,8 @@ static void applyFill(cPatternEditor::strFill* fillData, uint8_t editParam, bool
                                            fillData->param,
                                            fillData->from,
                                            fillData->from,
-                                           density);
+                                           density,
+                                           rotate);
                 }
                 else if (type == cPatternEditor::fillTypeFromTo)
                 {
@@ -3639,7 +3671,8 @@ static void applyFill(cPatternEditor::strFill* fillData, uint8_t editParam, bool
                                            fillData->param,
                                            fillData->from,
                                            fillData->to,
-                                           density);
+                                           density,
+                                           rotate);
                 }
                 else if (type == cPatternEditor::fillTypeRandom)
                 {
@@ -3648,7 +3681,8 @@ static void applyFill(cPatternEditor::strFill* fillData, uint8_t editParam, bool
                                            fillData->param,
                                            fillData->from,
                                            fillData->to,
-                                           density);
+                                           density,
+                                           rotate);
                 }
                 else if (type == cPatternEditor::fillTypeProb)
                 {
@@ -3658,7 +3692,8 @@ static void applyFill(cPatternEditor::strFill* fillData, uint8_t editParam, bool
                                            fillData->fillStep,
                                            fillData->genParam[gi][1],
                                            fillData->genParam[gi][2],
-                                           density);
+                                           density,
+                                           rotate);
                 }
                 else if (type == cPatternEditor::fillTypeRatchet)
                 {
@@ -3667,7 +3702,8 @@ static void applyFill(cPatternEditor::strFill* fillData, uint8_t editParam, bool
                                          fillData->fillStep,
                                          fillData->genParam[gi][1],
                                          fillData->genParam[gi][2],
-                                         density);
+                                         density,
+                                         rotate);
                 }
             }
             break;

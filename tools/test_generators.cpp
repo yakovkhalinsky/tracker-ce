@@ -311,12 +311,7 @@ static void testMarkov()
 // Mirrors Sequencer::isEuclideanStep (core/source/mtSequencer_patternEdit.cpp).
 static bool euclideanSelected(int offset, int density, int selectionLength)
 {
-    if (density <= 0)
-        return false;
-    float stepSize = (float)selectionLength / density;
-    float nearest = std::round(offset / stepSize) * stepSize;
-    float diff = nearest - (float)offset;
-    return diff <= 0.5f && diff > -0.5f;
+    return mtGen::euclideanHit(offset, density, selectionLength, 0);
 }
 
 static void testStepSelectors()
@@ -376,6 +371,120 @@ static void testStepSelectors()
     CHECK(randomSelected > 32 && randomSelected < 96);
 }
 
+static int countEuclideanHits(int length, int density, int rotate)
+{
+    int hits = 0;
+    for (int offset = 0; offset < length; offset++)
+    {
+        if (mtGen::euclideanHit(offset, density, length, rotate))
+            hits++;
+    }
+    return hits;
+}
+
+static void testEuclidean()
+{
+    // Classic E(3, 8) pattern.
+    const int expected[3] = { 0, 3, 6 };
+    int hitIndex = 0;
+    for (int offset = 0; offset < 8; offset++)
+    {
+        bool hit = mtGen::euclideanHit(offset, 3, 8, 0);
+        if (hit)
+        {
+            CHECK(hitIndex < 3);
+            CHECK(expected[hitIndex] == offset);
+            hitIndex++;
+        }
+    }
+    CHECK(hitIndex == 3);
+
+    // Exactly `density` hits for every density that fits the selection, at
+    // every rotation, and the hit count does not depend on rotation.
+    for (int length = 1; length <= 32; length++)
+    {
+        for (int density = 1; density <= length; density++)
+        {
+            for (int rotate : { 0, 1, length - 1, length, length + 5, -1 })
+            {
+                CHECK(countEuclideanHits(length, density, rotate) == density);
+            }
+        }
+    }
+
+    // Oversized Events clamp to the selection length (one hit per step), they
+    // never create more hits than there are steps.
+    for (int length = 1; length <= 32; length++)
+    {
+        for (int density : { length, length + 1, length * 4, 128, 1000 })
+        {
+            CHECK(countEuclideanHits(length, density, 0) == length);
+        }
+    }
+
+    // No events below density 1 or for an empty selection.
+    CHECK(countEuclideanHits(16, 0, 0) == 0);
+    CHECK(countEuclideanHits(16, -3, 0) == 0);
+    for (int offset = 0; offset < 8; offset++)
+    {
+        CHECK(!mtGen::euclideanHit(offset, 4, 0, 0));
+        CHECK(!mtGen::euclideanHit(offset, 4, -8, 0));
+    }
+
+    // Rotate shifts the pattern: offset with rotate r is the unrotated hit at
+    // offset + r (mod length).
+    for (int length = 2; length <= 24; length++)
+    {
+        for (int density = 1; density <= length; density++)
+        {
+            for (int rotate = 0; rotate < length; rotate++)
+            {
+                for (int offset = 0; offset < length; offset++)
+                {
+                    CHECK(mtGen::euclideanHit(offset, density, length, rotate) ==
+                          mtGen::euclideanHit((offset + rotate) % length, density, length, 0));
+                }
+            }
+        }
+    }
+
+    // Negative rotation wraps instead of shifting outside the pattern.
+    for (int rotate = -24; rotate < 0; rotate++)
+    {
+        for (int offset = 0; offset < 16; offset++)
+        {
+            CHECK(mtGen::euclideanHit(offset, 5, 16, rotate) ==
+                  mtGen::euclideanHit(offset, 5, 16, rotate + 16));
+        }
+    }
+}
+
+static void testInstrumentPick()
+{
+    const uint8_t samples[4] = { 0, 1, 47, 0 };
+    const uint8_t midi[4] = { 0, 49, 50, 0 };
+    const uint8_t synth[4] = { 0, 64, 65, 0 };
+    const uint8_t mixture[6] = { 0, 64, 48, 49, 65, 0 };
+    const uint8_t synthThenMidi[4] = { 64, 49, 0, 0 };
+
+    // No usable instrument on the track -> old fallback.
+    CHECK(mtGen::pickTrackFillInstrument(samples, 4, 48) == 48);
+
+    // Last MIDI instrument on the track.
+    CHECK(mtGen::pickTrackFillInstrument(midi, 4, 48) == 50);
+
+    // Last synth instrument on the track.
+    CHECK(mtGen::pickTrackFillInstrument(synth, 4, 48) == 65);
+
+    // Synth instruments beat MIDI instruments, whichever comes first.
+    CHECK(mtGen::pickTrackFillInstrument(mixture, 6, 48) == 65);
+    CHECK(mtGen::pickTrackFillInstrument(synthThenMidi, 4, 48) == 64);
+
+    CHECK(mtGen::pickTrackFillInstrument(nullptr, 4, 51) == 51);
+    CHECK(mtGen::pickTrackFillInstrument(midi, 0, 52) == 52);
+    CHECK(mtGen::pickTrackFillInstrument(midi, -1, 53) == 53);
+}
+
 static void testFxBounds()
 {
     CHECK(mtGen::chanceFromPercent(-10) == 0);
@@ -402,6 +511,8 @@ int main()
     testTuring();
     testMarkov();
     testStepSelectors();
+    testEuclidean();
+    testInstrumentPick();
     testFxBounds();
 
     std::printf("%d checks, %d failures\n", checks, failures);

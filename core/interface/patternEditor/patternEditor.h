@@ -317,6 +317,13 @@ class cPatternEditor : public ModuleBase
     };
     static constexpr int fillGenTypeCount = fillTypeCount - fillTypeWalk;
 
+    enum enFillAltMode
+    {
+        fillAltDensity = 0, // the step selector's Events count
+        fillAltRotate,      // Euclidean rotate (only for the Euclidean selector)
+        fillAltTypeParam,   // Max jump / Range for Walk / Turing / Markov
+    };
+
     struct strFill
     {
         int16_t fillStep;
@@ -336,6 +343,9 @@ class cPatternEditor : public ModuleBase
 
         // Turing register survives between runs (RAM only, never saved).
         uint16_t turingReg;
+        // Euclidean rotate, 0..selection length-1 (RAM only, never saved).
+        // Kept here because it fits the struct's alignment padding.
+        int16_t rotate;
         uint32_t turingRng;
         uint8_t turingSeeded;
     };
@@ -351,9 +361,15 @@ class cPatternEditor : public ModuleBase
     bool fillTypeHasAlt(int16_t type) const;
     bool fillStepUsesDensity(int16_t fillStep) const;
     bool fillAltSlotActive(const strFill& fill) const;
+    bool fillAltIsRotate(const strFill& fill) const;
+    bool fillAltIsTypeParam(const strFill& fill) const;
     int16_t fillAltMin(int16_t type) const;
     int16_t fillAltMax(int16_t type) const;
     const char* fillAltLabel(int16_t type) const;
+    int16_t fillRotateMax() const;
+    int16_t fillDensityMax(int16_t fillStep) const;
+    int16_t* fillAltValuePtr(strFill& fill, int16_t& min, int16_t& max) const;
+    void toggleFillAlt(const strFill& fill);
     const uint8_t* getFillTypesForColumn(uint8_t& count) const;
     uint8_t fillTypeToDisplayIndex(int16_t type) const;
     int16_t fillTypeFromDisplayIndex(uint8_t index) const;
@@ -363,7 +379,8 @@ class cPatternEditor : public ModuleBase
     const char* fillTypeName(int16_t type) const;
     void showFillAppliedStatus(int16_t type);
 
-    uint8_t fillAltActive = 0;
+    // Which value the second popup column edits: enFillAltMode.
+    uint8_t fillAltActive = fillAltDensity;
 
     bool isMicVolView = false;
     bool toggledMicVolOnPress = false;

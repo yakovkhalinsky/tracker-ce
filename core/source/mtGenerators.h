@@ -26,6 +26,26 @@ static constexpr int kChanceProbMax = 100;
 static constexpr int kRollPeriodMin = 1;
 static constexpr int kRollPeriodMax = 8;
 
+// Instrument layout, copied from mtStructs.h.  The sequencer adapter
+// static_asserts that these still match the real constants.
+static constexpr int kSampleInstrumentCount = 48;
+static constexpr int kMidiInstrumentStart = kSampleInstrumentCount;
+static constexpr int kSynthInstrumentStart = kMidiInstrumentStart + 16;
+
+//----------------------------------------------------------------------------
+// step selectors
+//----------------------------------------------------------------------------
+// Integer Bresenham Euclidean selector.  Returns true when `offset` is one
+// of the `density` events spread over `length` steps, rotated by `rotate`
+// steps.  `density` is clamped to the selection length so an oversized Events
+// value cannot hit every step more than once; density < 1 selects nothing.
+bool euclideanHit(int offset, int density, int length, int rotate);
+
+// Picks the instrument a note fill should write on a non-sample track.
+// The last synth instrument used on the track wins, then the last MIDI
+// instrument, then `fallbackInstrument`.  Sample instruments are ignored.
+int pickTrackFillInstrument(const uint8_t* instruments, int count, int fallbackInstrument);
+
 //----------------------------------------------------------------------------
 // scales
 //----------------------------------------------------------------------------
