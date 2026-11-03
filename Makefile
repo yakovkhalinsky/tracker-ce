@@ -23,7 +23,7 @@ MINI_POSTFIX     := $(EDITION_NAME)_$(MINI_VER_MAJOR).$(MINI_VER_MINOR).$(MINI_V
 
 .DEFAULT_GOAL := all
 
-.PHONY: all original plus mini ptfx clean version bump-patch bump-minor
+.PHONY: all original plus mini ptfx clean version bump-patch bump-minor gen-test gen-artifact
 
 all: original plus mini
 
@@ -97,6 +97,20 @@ ptfx:
 		base=$$(basename "$$src" .c); \
 		python3 "$(ROOT_DIR)/editor-fx-sdk/ptfx_builder.py" "$$src" -o "$(ROOT_DIR)/editor-fx-sdk/build/Effects/$$base.ptfx" --toolchain "$(TOOLCHAIN)"; \
 	done
+
+# Copies the freshly built Mini image under the Phase 1 artifact name.
+gen-artifact:
+	@cp "$(OUT_DIR)/TrackerMini_$(MINI_POSTFIX).ptf" "$(OUT_DIR)/TrackerMini_CE_gen_0.1.ptf"
+	@echo "-> Output: $(OUT_DIR)/TrackerMini_CE_gen_0.1.ptf"
+
+# Host-side unit tests for the generative fill algorithms (plain g++).
+gen-test:
+	@mkdir -p "$(OUT_DIR)"
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -I"$(CORE_DIR)/source" \
+		"$(ROOT_DIR)/tools/test_generators.cpp" \
+		"$(CORE_DIR)/source/mtGenerators.cpp" \
+		-o "$(OUT_DIR)/test_generators"
+	@"$(OUT_DIR)/test_generators"
 
 clean:
 	$(MAKE) -C "$(CORE_DIR)" clean PLATFORM=MK66 PRODUCT=ORIGINAL
