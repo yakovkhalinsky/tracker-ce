@@ -493,7 +493,29 @@ bool cPatternEditor::fillAltSlotActive(const strFill& fill) const
 
 int16_t cPatternEditor::fillRotateMax() const
 {
-    int length = (int)sequencer.selection.lastStep - (int)sequencer.selection.firstStep + 1;
+    // Use the editor's live selection: sequencer.selection is only pushed to
+    // the sequencer when the fill is applied.
+    int length = 1;
+    if (trackerPattern.selectState == 2)
+    {
+        if (trackerPattern.selectColumn)
+        {
+            length = sequencer.getPatternLength();
+        }
+        else
+        {
+            int first = trackerPattern.selectStartStep;
+            int last = trackerPattern.selectEndStep;
+            if (first > last)
+            {
+                const int swap = first;
+                first = last;
+                last = swap;
+            }
+            length = last - first + 1;
+        }
+    }
+
     if (length < 1)
         length = 1;
     return (int16_t)(length - 1);
