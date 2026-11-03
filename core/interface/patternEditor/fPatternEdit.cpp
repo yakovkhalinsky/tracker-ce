@@ -24,6 +24,15 @@
 __NOINIT(EXTERNAL_RAM) strTrackerPattern cPatternEditor::trackerPattern;
 __NOINIT(EXTERNAL_RAM) cPatternEditor::strFill cPatternEditor::fillData[6];
 
+// Last applied fill (Shift+Enter re-run).  Kept in external RAM; the index is
+// initialized by initExternalRamState().
+static __NOINIT(EXTERNAL_RAM) cPatternEditor::strFill s_lastFill;
+static uint8_t s_lastFillIdx = 0xFF;
+static uint8_t s_lastFillEditParam = 0;
+static uint8_t s_lastFillIsMicVol = 0;
+static uint8_t s_fillRerunActive = 0;
+static uint8_t s_fillStatusPending = 0;
+
 cPatternEditor patternEditor;
 static cPatternEditor* PTE = &patternEditor;
 
@@ -71,6 +80,10 @@ static void functSwitchModule(uint8_t button);
 // fill
 static void functFillCancel();
 static void functFillApply();
+static void applyFill(cPatternEditor::strFill* fillData, uint8_t editParam, bool micVolView);
+#ifdef TRACKER_MINI
+static void rerunLastFill();
+#endif
 static void functFillAction1();
 static void functFillAction2();
 static void functFillAction3();
@@ -160,9 +173,39 @@ void cPatternEditor::initExternalRamState()
         fillData[i].density[Sequencer::fillStepByStep] = 1;
         fillData[i].density[Sequencer::fillStepEuclidean] = 3;
         fillData[i].fillStep = Sequencer::fillStepByStep;
+
+        // Defaults for the generated fill types.  They are remembered per
+        // column (and per type) for the rest of the session.
+        // Walk: scale, from, to, max jump
+        fillData[i].genParam[fillTypeWalk - fillTypeWalk][0] = 0;
+        fillData[i].genParam[fillTypeWalk - fillTypeWalk][1] = 48;
+        fillData[i].genParam[fillTypeWalk - fillTypeWalk][2] = 60;
+        fillData[i].genParam[fillTypeWalk - fillTypeWalk][3] = 2;
+        // Turing: scale, length, lock, range
+        fillData[i].genParam[fillTypeTuring - fillTypeWalk][0] = 0;
+        fillData[i].genParam[fillTypeTuring - fillTypeWalk][1] = 8;
+        fillData[i].genParam[fillTypeTuring - fillTypeWalk][2] = 100;
+        fillData[i].genParam[fillTypeTuring - fillTypeWalk][3] = 24;
+        // Markov: scale, source, order, range
+        fillData[i].genParam[fillTypeMarkov - fillTypeWalk][0] = 0;
+        fillData[i].genParam[fillTypeMarkov - fillTypeWalk][1] = 0;
+        fillData[i].genParam[fillTypeMarkov - fillTypeWalk][2] = 1;
+        fillData[i].genParam[fillTypeMarkov - fillTypeWalk][3] = 24;
+        // Prob: FX slot, prob %, count
+        fillData[i].genParam[fillTypeProb - fillTypeWalk][0] = 0;
+        fillData[i].genParam[fillTypeProb - fillTypeWalk][1] = 100;
+        fillData[i].genParam[fillTypeProb - fillTypeWalk][2] = 0;
+        // Ratchet: FX slot, prob %, period
+        fillData[i].genParam[fillTypeRatchet - fillTypeWalk][0] = 0;
+        fillData[i].genParam[fillTypeRatchet - fillTypeWalk][1] = 100;
+        fillData[i].genParam[fillTypeRatchet - fillTypeWalk][2] = 4;
     }
     fillData[5].from = 50;
     fillData[5].to = 50;
+
+    s_lastFillIdx = 0xFF;
+    s_fillRerunActive = 0;
+    s_fillStatusPending = 0;
 }
 
 elapsedMillis patternRefreshTimer;
@@ -1503,243 +1546,272 @@ void cPatternEditor::setPlayheadRangeFromSelection()
 
 void cPatternEditor::changeFillData(int16_t value, bool rollListOver)
 {
-    if (fillPlace < 0 && fillPlace > 5)
+    if (fillPlace < 0 || fillPlace > 5)
         return;
 
-    int16_t* ptrVal;
-    int16_t min = 0, max;
-    uint8_t fillParam = fillPlace;
     uint8_t fillIdx = getFillDataIdx();
+    strFill& fill = fillData[fillIdx];
 
-    switch (fillPlace)
+    if (fillPlace == 0) // step selector
     {
-        case 1: fillParam = 5; break; // density
-        case 2: fillParam = 4; break; // param
-        case 3: fillParam = 1; break; // type
-        case 4: fillParam = 2; break; // from
-        case 5: fillParam = 3; break; // to
+        int16_t next = fill.fillStep + value;
+        if (next < Sequencer::fillStepNote)
+            next = Sequencer::fillStepNote;
+        else if (next > Sequencer::fillStepEnd__ - 1)
+            next = rollListOver ? Sequencer::fillStepNote : Sequencer::fillStepEnd__ - 1;
+        fill.fillStep = next;
+
+        // Density selectors (Euclidean / Each / Random) always show Events
+        // first when the step mode changes.
+        fillAltActive = fillAltDensity;
+
+        if (fill.fillStep == Sequencer::fillStepEuclidean)
+        {
+            fill.density[fill.fillStep] =
+              clamp<int>(fill.density[fill.fillStep], 1, fillDensityMax(fill.fillStep));
+            fill.rotate = clamp<int>(fill.rotate, 0, fillRotateMax());
+        }
+
+        if (!isFillPlaceValid(fillPlace))
+            fillPlace = 0;
+
+        refreshFillStep();
+        activateFillPopupBorder();
+        return;
     }
 
-    switch (fillParam)
+    if (fillPlace == 3) // fill type, filtered by the current column
     {
-        case 0: // step
-            ptrVal = &fillData[fillIdx].fillStep;
-            min = Sequencer::fillStepNote;
-            max = Sequencer::fillStepEnd__ - 1;
-            break;
-        case 1: // type
-            ptrVal = &fillData[fillIdx].type;
-            max = fillTypeList.length - 1;
-            break;
-        case 2: // from
-            if (editParam == EditInstr)
-            {
-                value = clamp<int>(value, -5, 5);
-            }
-            ptrVal = &fillData[fillIdx].from;
-            if (isMicVolView && editParam >= EditFx1)
-            {
-                min = 0;
-                max = 100;
-            }
-            else
-            {
-                min = (editParam < EditFx1
-                         ? 0
-                         : sequencer.getFxMin(interfaceGlobals.fxIDs[fillData[fillIdx].param]));
-                max = (editParam == EditNote
-                         ? 127
-                         : (editParam == EditInstr
-                              ? kTotalInstrumentsCount - 1
-                              : sequencer.getFxMax(interfaceGlobals.fxIDs[fillData[fillIdx].param])));
-            }
-            break;
-        case 3: // to
-            if (fillData[fillIdx].type == 0)
-            {
-                return;
-            }
-            if (editParam == EditInstr)
-            {
-                value = clamp<int>(value, -5, 5);
-            }
-            ptrVal = &fillData[fillIdx].to;
-            if (isMicVolView && editParam >= EditFx1)
-            {
-                min = 0;
-                max = 100;
-            }
-            else
-            {
-                min = (editParam < EditFx1
-                         ? 0
-                         : sequencer.getFxMin(interfaceGlobals.fxIDs[fillData[fillIdx].param]));
-                max = (editParam == EditNote
-                         ? 127
-                         : (editParam == EditInstr
-                              ? kTotalInstrumentsCount - 1
-                              : sequencer.getFxMax(interfaceGlobals.fxIDs[fillData[fillIdx].param])));
-            }
-            break;
-        case 4: // param
-            if (isMicVolView && editParam >= EditFx1)
-            {
-                return;
-            }
-            value = clamp<int>(value, -5, 5);
-            ptrVal = &fillData[fillIdx].param;
-            min = (editParam == EditNote ? 0 : -1);
-            max = (editParam == EditNote ? MAX_SCALE : FX_COUNT - 1 - FX_COUNT_HIDDEN_FXes);
-            break;
-        case 5: // density
-            ptrVal = &fillData[fillIdx].density[fillData[fillIdx].fillStep];
-            min = 1;
-            max = Sequencer::MAX_FILL_DENSITY;
-            break;
+        uint8_t count = 0;
+        const uint8_t* types = getFillTypesForColumn(count);
+        int pos = fillTypeToDisplayIndex(fill.type);
+        int next = pos + value;
+        if (next < 0)
+            next = rollListOver ? count - 1 : 0;
+        else if (next >= count)
+            next = rollListOver ? 0 : count - 1;
 
-        default: return;
+        fill.type = types[next];
+        fillAltActive = 0;
+
+        if (!isFillPlaceValid(fillPlace))
+            fillPlace = 4;
+
+        refreshFillType();
+        activateFillPopupBorder();
+        return;
     }
 
-    if (*ptrVal + value < min)
-        *ptrVal = min;
-    else if (*ptrVal + value > max)
-        *ptrVal = (rollListOver ? min : max);
+    if (fillPlace == 1) // density, or the type's alternate parameter
+    {
+        if (fillAltSlotActive(fill))
+        {
+            int16_t min = 0;
+            int16_t max = 0;
+            int16_t* ptr = fillAltValuePtr(fill, min, max);
+            int16_t next = *ptr + value;
+            if (next < min)
+                next = rollListOver ? max : min;
+            else if (next > max)
+                next = rollListOver ? min : max;
+            *ptr = next;
+            refreshFillDensity();
+            return;
+        }
+
+        int16_t* ptr = &fill.density[fill.fillStep];
+        int16_t max = fillDensityMax(fill.fillStep);
+        int16_t next = *ptr + value;
+        if (next < 1)
+            next = rollListOver ? max : 1;
+        else if (next > max)
+            next = rollListOver ? 1 : max;
+        *ptr = next;
+        refreshFillDensity();
+        return;
+    }
+
+    // slots 2 (parameters/scale/FX), 4 and 5
+    uint8_t slot = (fillPlace == 2) ? 2 : (fillPlace == 4) ? 4 : 5;
+
+    if (slot == 5 && fill.type == fillTypeConstant)
+        return;
+    if (slot == 2 && (editParam == EditInstr || (isMicVolView && editParam >= EditFx1)))
+        return;
+
+    if (editParam == EditInstr && (slot == 4 || slot == 5))
+        value = clamp<int>(value, -5, 5);
+
+    int16_t min = 0;
+    int16_t max = 0;
+    int16_t* ptr = fillValuePtr(fill, slot, min, max);
+
+    int16_t next = *ptr + value;
+    if (next < min)
+        next = rollListOver ? max : min;
+    else if (next > max)
+        next = rollListOver ? min : max;
+    *ptr = next;
+
+    if (slot == 2)
+        refreshFillParam();
+    else if (slot == 4)
+        refreshFillFrom();
     else
-        *ptrVal += value;
+        refreshFillTo();
 
-    switch (fillParam)
-    {
-        case 0: refreshFillStep(); break;
-        case 1: refreshFillType(); break;
-        case 2: refreshFillFrom(); break;
-        case 3: refreshFillTo(); break;
-        case 4: refreshFillParam(); break;
-        case 5: refreshFillDensity(); break;
-        default: return;
-    }
+    activateFillPopupBorder();
 }
 
 void cPatternEditor::changneFillDataByPad(uint8_t pad)
 {
-    uint8_t fillParam = fillPlace;
     uint8_t fillIdx = getFillDataIdx();
+    strFill& fill = fillData[fillIdx];
+
+    bool isBeatSlice = mtProject.instrument[mtProject.values.lastUsedInstrument].playMode ==
+                       playModeBeatSlice;
 
     switch (fillPlace)
     {
-        case 1: fillParam = 5; break; // density
-        case 2: fillParam = 4; break; // param
-        case 3: fillParam = 1; break; // type
-        case 4: fillParam = 2; break; // from
-        case 5: fillParam = 3; break; // to
-    }
-
-    switch (fillParam)
-    {
-        case 0: // step
+        case 0: // step selector
         {
             if (pad < Sequencer::fillStepEnd__)
-                fillData[fillIdx].fillStep = pad;
-            break;
-        }
-        case 1: // type
-        {
-            if (pad < 3)
-                fillData[fillIdx].type = pad;
-            break;
-        }
-        case 2: // from
-        {
-            if (editParam == EditNote)
-            {
-                bool isBeatSlice =
-                  mtProject.instrument[mtProject.values.lastUsedInstrument].playMode ==
-                  playModeBeatSlice;
+                fill.fillStep = pad;
 
-                fillData[fillIdx].from = mtPadBoard.getNoteFromPad(pad, isBeatSlice);
+            fillAltActive = fillAltDensity;
+            if (fill.fillStep == Sequencer::fillStepEuclidean)
+            {
+                fill.density[fill.fillStep] =
+                  clamp<int>(fill.density[fill.fillStep], 1, fillDensityMax(fill.fillStep));
+                fill.rotate = clamp<int>(fill.rotate, 0, fillRotateMax());
             }
-            else if (editParam == EditInstr)
-                fillData[fillIdx].from = pad;
-            else if (isMicVolView)
-                fillData[fillIdx].from = roundf(mapClamped<float>(pad, 0, 47, 0, 100));
+
+            if (!isFillPlaceValid(fillPlace))
+                fillPlace = 0;
+            refreshFillStep();
+            break;
+        }
+        case 1: // density / alternate parameter
+        {
+            if (fillAltSlotActive(fill))
+            {
+                int16_t min = 0;
+                int16_t max = 0;
+                int16_t* ptr = fillAltValuePtr(fill, min, max);
+                *ptr = mapClamped<int>(pad, 0, 47, min, max);
+                refreshFillDensity();
+            }
             else
             {
-                int16_t min_fx =
-                  sequencer.getFxMin(interfaceGlobals.fxIDs[fillData[fillIdx].param]);
-                int16_t max_fx =
-                  sequencer.getFxMax(interfaceGlobals.fxIDs[fillData[fillIdx].param]);
-
-                fillData[fillIdx].from = mapClamped<int>(pad, 0, 47, min_fx, max_fx);
-
-                if (fillData[fillIdx].from < min_fx)
-                    fillData[fillIdx].from = min_fx;
-                if (fillData[fillIdx].from > max_fx)
-                    fillData[fillIdx].from = max_fx;
+                fill.density[fill.fillStep] =
+                  mapClamped<int>(pad, 0, 47, 1, fillDensityMax(fill.fillStep));
+                refreshFillDensity();
             }
             break;
         }
-        case 3: // to
+        case 2: // parameter (scale / FX type / FX slot)
         {
             if (editParam == EditNote)
             {
-                bool isBeatSlice =
-                  mtProject.instrument[mtProject.values.lastUsedInstrument].playMode ==
-                  playModeBeatSlice;
-
-                fillData[fillIdx].to = mtPadBoard.getNoteFromPad(pad, isBeatSlice);
+                if (pad <= MAX_SCALE)
+                {
+                    int16_t min = 0;
+                    int16_t max = 0;
+                    int16_t* ptr = fillValuePtr(fill, 2, min, max);
+                    *ptr = pad; // scale index, same for legacy and generated types
+                }
+                refreshFillParam();
             }
-            else if (editParam == EditInstr)
-                fillData[fillIdx].to = pad;
-            else if (isMicVolView)
-                fillData[fillIdx].to = roundf(mapClamped<float>(pad, 0, 47, 0, 100));
+            else if (editParam == EditInstr || isMicVolView)
+            {
+                break;
+            }
+            else if (fill.type == fillTypeProb || fill.type == fillTypeRatchet)
+            {
+                int16_t min = 0;
+                int16_t max = 0;
+                int16_t* ptr = fillValuePtr(fill, 2, min, max);
+                *ptr = pad & 1; // FX1 / FX2
+                refreshFillParam();
+            }
             else
-            {
-                int16_t min_fx =
-                  sequencer.getFxMin(interfaceGlobals.fxIDs[fillData[fillIdx].param]);
-                int16_t max_fx =
-                  sequencer.getFxMax(interfaceGlobals.fxIDs[fillData[fillIdx].param]);
-
-                fillData[fillIdx].to = mapClamped<int>(pad, 0, 47, min_fx, max_fx);
-
-                if (fillData[fillIdx].to < min_fx)
-                    fillData[fillIdx].to = min_fx;
-                if (fillData[fillIdx].to > max_fx)
-                    fillData[fillIdx].to = max_fx;
-            }
-            break;
-        }
-        case 4: // param
-        {
-            if (editParam == EditNote)
-            {
-                if (pad < MAX_SCALE)
-                    fillData[fillIdx].param = pad;
-            }
-            else if (editParam >= 2 && !isMicVolView)
             {
                 if (pad < FX_COUNT - FX_COUNT_HIDDEN_FXes)
-                    fillData[fillIdx].param = pad;
+                    fill.param = pad;
+                refreshFillParam();
             }
+            break;
+        }
+        case 3: // fill type, filtered by column
+        {
+            uint8_t count = 0;
+            const uint8_t* types = getFillTypesForColumn(count);
+            if (pad < count)
+            {
+                fill.type = types[pad];
+                fillAltActive = 0;
+                if (!isFillPlaceValid(fillPlace))
+                    fillPlace = 4;
+            }
+            refreshFillType();
+            break;
+        }
+        case 4: // from / length / source / prob
+        case 5: // to / lock / order / count
+        {
+            uint8_t slot = (fillPlace == 4) ? 4 : 5;
+            if (slot == 5 && fill.type == fillTypeConstant)
+                break;
+
+            int16_t min = 0;
+            int16_t max = 0;
+            int16_t* ptr = fillValuePtr(fill, slot, min, max);
+
+            if (editParam == EditNote && fill.type != fillTypeTuring &&
+                fill.type != fillTypeMarkov)
+            {
+                *ptr = mtPadBoard.getNoteFromPad(pad, isBeatSlice);
+            }
+            else
+            {
+                *ptr = mapClamped<int>(pad, 0, 47, min, max);
+            }
+
+            if (slot == 4)
+                refreshFillFrom();
+            else
+                refreshFillTo();
             break;
         }
         default: break;
     }
 
-    switch (fillParam)
-    {
-        case 0: refreshFillStep(); break;
-        case 1: refreshFillType(); break;
-        case 2: refreshFillFrom(); break;
-        case 3: refreshFillTo(); break;
-        case 4: refreshFillParam(); break;
-        case 5: refreshFillDensity(); break;
-        default: return;
-    }
+    activateFillPopupBorder();
 }
 
 void cPatternEditor::changeFillDataByActionButton(uint8_t place)
 {
     if (place > 5)
         return;
+
+    // The second column can carry more than one setting while a density
+    // selector (Euclidean / Each / Random) is active: the Events count, the
+    // Euclidean Rotate, and (for Walk / Turing / Markov) the type's alternate
+    // parameter.  Pressing the slot button cycles through the available ones;
+    // +/- keeps editing the value that is currently shown.
+    if (place == 1 && fillPlace == 1)
+    {
+        uint8_t fillIdx = getFillDataIdx();
+        strFill& fill = fillData[fillIdx];
+        const bool hasRotate = fill.fillStep == Sequencer::fillStepEuclidean;
+        const bool hasTypeAlt = fillTypeHasAlt(fill.type);
+        if (fillStepUsesDensity(fill.fillStep) && (hasRotate || hasTypeAlt))
+        {
+            toggleFillAlt(fill);
+            refreshFillDensity();
+            return;
+        }
+    }
 
     if (place == fillPlace && (place < 4 || editParam == EditInstr || editParam == EditNote))
     {
@@ -1749,12 +1821,26 @@ void cPatternEditor::changeFillDataByActionButton(uint8_t place)
 
 bool cPatternEditor::isFillPlaceValid(uint8_t place)
 {
+    if (place > 5)
+        return false;
+
     uint8_t fillIdx = getFillDataIdx();
+    const strFill& fill = fillData[fillIdx];
+
     // place 2 not available in instrument mode or mic/vol mode
-    // place 1 not available in some step modes
-    return !(((editParam == EditInstr || (isMicVolView && editParam >= EditFx1)) && place == 2) ||
-             (fillData[fillIdx].fillStep < Sequencer::fillStepRandom && place == 1) ||
-             (fillData[fillIdx].type == 0 && place > 4));
+    if ((editParam == EditInstr || (isMicVolView && editParam >= EditFx1)) && place == 2)
+        return false;
+
+    // place 1 is density when the step selector uses it, and the alternate
+    // type parameter otherwise (Walk / Turing / Markov).
+    if (place == 1)
+        return fillStepUsesDensity(fill.fillStep) || fillTypeHasAlt(fill.type);
+
+    // Constant has no second value.
+    if (place == 5)
+        return fill.type != fillTypeConstant;
+
+    return true;
 }
 
 void cPatternEditor::setFillPlace(uint8_t place, int8_t dir)
@@ -2114,6 +2200,16 @@ static void functShift(uint8_t state)
 
         // PTE->showMuteButtons(0);
         PTE->refreshEditState(); // <<== zawiera PTE->refreshActualActionButtonPage();
+
+#ifdef TRACKER_MINI
+        // Shift is released after the middle button; re-show the re-run
+        // status that refreshEditState() just overwrote.
+        if (s_fillStatusPending)
+        {
+            s_fillStatusPending = 0;
+            PTE->showFillAppliedStatus(s_lastFill.type);
+        }
+#endif
 
         if (mtPopups.isNoteKeyboardPopupActive())
         {
@@ -3434,6 +3530,225 @@ static void functFillCancel()
     PTE->start(0);
 }
 
+// Applies one fill configuration to the current sequencer selection.
+static void applyFill(cPatternEditor::strFill* fillData, uint8_t editParam, bool micVolView)
+{
+    const int16_t type = fillData->type;
+    const int16_t density = fillData->density[fillData->fillStep];
+    const int16_t rotate = fillData->rotate;
+    const int gi = type - cPatternEditor::fillTypeWalk;
+
+    switch (editParam)
+    {
+        case cPatternEditor::EditNote:
+            switch (type)
+            {
+                case cPatternEditor::fillTypeConstant:
+                    sequencer.fillLinearNotes(fillData->fillStep,
+                                              fillData->param,
+                                              fillData->from,
+                                              fillData->from,
+                                              density,
+                                              rotate);
+                    break;
+                case cPatternEditor::fillTypeFromTo:
+                    sequencer.fillLinearNotes(fillData->fillStep,
+                                              fillData->param,
+                                              fillData->from,
+                                              fillData->to,
+                                              density,
+                                              rotate);
+                    break;
+                case cPatternEditor::fillTypeRandom:
+                    sequencer.fillRandomNotes(fillData->fillStep,
+                                              fillData->param,
+                                              fillData->from,
+                                              fillData->to,
+                                              density,
+                                              rotate);
+                    break;
+                case cPatternEditor::fillTypeWalk:
+                    sequencer.fillWalkNotes(fillData->fillStep,
+                                            fillData->genParam[gi][0],
+                                            fillData->genParam[gi][1],
+                                            fillData->genParam[gi][2],
+                                            fillData->genParam[gi][3],
+                                            density,
+                                            rotate);
+                    break;
+                case cPatternEditor::fillTypeTuring:
+                    sequencer.fillTuringNotes(fillData->fillStep,
+                                              fillData->genParam[gi][0],
+                                              fillData->genParam[gi][3],
+                                              fillData->genParam[gi][1],
+                                              fillData->genParam[gi][2],
+                                              density,
+                                              rotate,
+                                              &fillData->turingReg,
+                                              &fillData->turingRng,
+                                              &fillData->turingSeeded);
+                    break;
+                case cPatternEditor::fillTypeMarkov:
+                    sequencer.fillMarkovNotes(fillData->fillStep,
+                                              fillData->genParam[gi][0],
+                                              fillData->genParam[gi][1],
+                                              fillData->genParam[gi][3],
+                                              fillData->genParam[gi][2],
+                                              density,
+                                              rotate);
+                    break;
+                default: break;
+            }
+            break;
+
+        case cPatternEditor::EditInstr:
+            if (type == cPatternEditor::fillTypeConstant)
+            {
+                sequencer.fillLinearInstruments(
+                  fillData->fillStep, fillData->from, fillData->from, density, rotate);
+            }
+            else if (type == cPatternEditor::fillTypeFromTo)
+            {
+                sequencer.fillLinearInstruments(
+                  fillData->fillStep, fillData->from, fillData->to, density, rotate);
+            }
+            else if (type == cPatternEditor::fillTypeRandom)
+            {
+                sequencer.fillRandomInstruments(
+                  fillData->fillStep, fillData->from, fillData->to, density, rotate);
+            }
+            break;
+
+        case cPatternEditor::EditFx1:
+        case cPatternEditor::EditFx2:
+            if (micVolView)
+            {
+                if (editParam == cPatternEditor::EditFx1)
+                {
+                    if (type == cPatternEditor::fillTypeConstant)
+                        sequencer.fillLinearMicromove(
+                          fillData->fillStep, fillData->from, fillData->from, density, rotate);
+                    else if (type == cPatternEditor::fillTypeFromTo)
+                        sequencer.fillLinearMicromove(
+                          fillData->fillStep, fillData->from, fillData->to, density, rotate);
+                    else if (type == cPatternEditor::fillTypeRandom)
+                        sequencer.fillRandomMicromove(
+                          fillData->fillStep, fillData->from, fillData->to, density, rotate);
+                }
+                else
+                {
+                    if (type == cPatternEditor::fillTypeConstant)
+                        sequencer.fillLinearVolume(
+                          fillData->fillStep, fillData->from, fillData->from, density, rotate);
+                    else if (type == cPatternEditor::fillTypeFromTo)
+                        sequencer.fillLinearVolume(
+                          fillData->fillStep, fillData->from, fillData->to, density, rotate);
+                    else if (type == cPatternEditor::fillTypeRandom)
+                        sequencer.fillRandomVolume(
+                          fillData->fillStep, fillData->from, fillData->to, density, rotate);
+                }
+                break;
+            }
+
+            {
+                const uint8_t fx_index =
+                  editParam == cPatternEditor::EditFx1 ? 1 : 0;
+
+                if (type == cPatternEditor::fillTypeConstant)
+                {
+                    sequencer.fillLinearFx(fx_index,
+                                           fillData->fillStep,
+                                           fillData->param,
+                                           fillData->from,
+                                           fillData->from,
+                                           density,
+                                           rotate);
+                }
+                else if (type == cPatternEditor::fillTypeFromTo)
+                {
+                    sequencer.fillLinearFx(fx_index,
+                                           fillData->fillStep,
+                                           fillData->param,
+                                           fillData->from,
+                                           fillData->to,
+                                           density,
+                                           rotate);
+                }
+                else if (type == cPatternEditor::fillTypeRandom)
+                {
+                    sequencer.fillRandomFx(fx_index,
+                                           fillData->fillStep,
+                                           fillData->param,
+                                           fillData->from,
+                                           fillData->to,
+                                           density,
+                                           rotate);
+                }
+                else if (type == cPatternEditor::fillTypeProb)
+                {
+                    // genParam[0]: 0 = FX1 (fx[1]), 1 = FX2 (fx[0])
+                    const uint8_t target = fillData->genParam[gi][0] == 0 ? 1 : 0;
+                    sequencer.fillChanceFx(target,
+                                           fillData->fillStep,
+                                           fillData->genParam[gi][1],
+                                           fillData->genParam[gi][2],
+                                           density,
+                                           rotate);
+                }
+                else if (type == cPatternEditor::fillTypeRatchet)
+                {
+                    const uint8_t target = fillData->genParam[gi][0] == 0 ? 1 : 0;
+                    sequencer.fillRollFx(target,
+                                         fillData->fillStep,
+                                         fillData->genParam[gi][1],
+                                         fillData->genParam[gi][2],
+                                         density,
+                                         rotate);
+                }
+            }
+            break;
+
+        default: break;
+    }
+}
+
+#ifdef TRACKER_MINI
+static void rerunLastFill()
+{
+    if (s_lastFillIdx >= 6)
+        return;
+
+    newFileManager.storePatternUndoRevision();
+
+    if (isMultiSelection())
+    {
+        sendSelection();
+    }
+    else
+    {
+        const uint8_t track = (uint8_t)getActualTrack();
+        const uint8_t lastStep = sequencer.getActualPattern()->track[track].length;
+        sequencer.setSelection(0, track, lastStep, track);
+    }
+
+    applyFill(&s_lastFill, s_lastFillEditParam, s_lastFillIsMicVol != 0);
+
+    // Keep the Turing register in sync with the per-column remembered state,
+    // so a later Apply continues from the same register.
+    if (s_lastFill.type == cPatternEditor::fillTypeTuring && s_lastFillIdx < 6)
+    {
+        PTE->fillData[s_lastFillIdx].turingReg = s_lastFill.turingReg;
+        PTE->fillData[s_lastFillIdx].turingRng = s_lastFill.turingRng;
+        PTE->fillData[s_lastFillIdx].turingSeeded = s_lastFill.turingSeeded;
+    }
+
+    newFileManager.setActualPatternStructChanged();
+    PTE->refreshPattern();
+    PTE->showFillAppliedStatus(s_lastFill.type);
+    s_fillStatusPending = 1;
+}
+#endif
+
 static void functFillApply()
 {
     // zatwierdzanie wypelnienia
@@ -3441,168 +3756,23 @@ static void functFillApply()
     {
         newFileManager.storePatternUndoRevision();
         cPatternEditor::strFill* fillData = &PTE->fillData[PTE->getFillDataIdx()];
-        //(void) PTE->fillData[PTE->editParam];
-        //(void) PTE->fillStep;
-        // PTE->fillData[x]		<= przechowuje dane do konfiguracji fill
-        // x - (0-3)(PTE->editParam) - co wypelnia - nuta , instr , vol , fx
-        // 							type  	 = typ wypelninia (0-3);
-        //							from	 = pierwsza wartosc (0-127 - nuty/vol/fx_val , 0-48
-        // instr) 							to		 = druga wartosc (jesli potrzebna)
-        // param = scala yes/no (0-1) albo typ efektu (0-xx)
-        //
-        // PTE->fillStep 		<= krok dla filowania
-        // PTE->editParam		<= nuta / instr / vol / fx
-        //--------------------------------------------------------
-        // TU
+        const int16_t appliedType = fillData->type;
+
+        s_lastFillIdx = PTE->getFillDataIdx();
+        s_lastFillEditParam = PTE->editParam;
+        s_lastFillIsMicVol = PTE->isMicVolView ? 1 : 0;
+
         sendSelection();
-        switch (PTE->editParam)
-        {
-            case cPatternEditor::EditNote:
-                if (fillData->type == 2)
-                {
-                    sequencer.fillRandomNotes(fillData->fillStep,
-                                              fillData->param,
-                                              fillData->from,
-                                              fillData->to,
-                                              fillData->density[fillData->fillStep]);
-                }
-                else if (fillData->type == 1)
-                {
-                    sequencer.fillLinearNotes(fillData->fillStep,
-                                              fillData->param,
-                                              fillData->from,
-                                              fillData->to,
-                                              fillData->density[fillData->fillStep]);
-                }
-                else if (fillData->type == 0)
-                {
-                    sequencer.fillLinearNotes(fillData->fillStep,
-                                              fillData->param,
-                                              fillData->from,
-                                              fillData->from,
-                                              fillData->density[fillData->fillStep]);
-                }
+        applyFill(fillData, PTE->editParam, PTE->isMicVolView);
 
-                break;
-            case cPatternEditor::EditInstr:
-                if (fillData->type == 0)
-                {
-                    sequencer.fillLinearInstruments(fillData->fillStep,
-                                                    fillData->from,
-                                                    fillData->from,
-                                                    fillData->density[fillData->fillStep]);
-                }
-                else if (fillData->type == 1)
-                {
-                    sequencer.fillLinearInstruments(fillData->fillStep,
-                                                    fillData->from,
-                                                    fillData->to,
-                                                    fillData->density[fillData->fillStep]);
-                }
-                else if (fillData->type == 2)
-                {
-                    sequencer.fillRandomInstruments(fillData->fillStep,
-                                                    fillData->from,
-                                                    fillData->to,
-                                                    fillData->density[fillData->fillStep]);
-                }
-
-                break;
-
-            case cPatternEditor::EditFx1:
-            case cPatternEditor::EditFx2:
-            {
-                if (PTE->isMicVolView)
-                {
-                    if (PTE->editParam == cPatternEditor::EditFx1)
-                    {
-                        if (fillData->type == 0)
-                        {
-                            sequencer.fillLinearMicromove(fillData->fillStep,
-                                                          fillData->from,
-                                                          fillData->from,
-                                                          fillData->density[fillData->fillStep]);
-                        }
-                        else if (fillData->type == 1)
-                        {
-                            sequencer.fillLinearMicromove(fillData->fillStep,
-                                                          fillData->from,
-                                                          fillData->to,
-                                                          fillData->density[fillData->fillStep]);
-                        }
-                        else if (fillData->type == 2)
-                        {
-                            sequencer.fillRandomMicromove(fillData->fillStep,
-                                                          fillData->from,
-                                                          fillData->to,
-                                                          fillData->density[fillData->fillStep]);
-                        }
-                    }
-                    else
-                    {
-                        if (fillData->type == 0)
-                        {
-                            sequencer.fillLinearVolume(fillData->fillStep,
-                                                       fillData->from,
-                                                       fillData->from,
-                                                       fillData->density[fillData->fillStep]);
-                        }
-                        else if (fillData->type == 1)
-                        {
-                            sequencer.fillLinearVolume(fillData->fillStep,
-                                                       fillData->from,
-                                                       fillData->to,
-                                                       fillData->density[fillData->fillStep]);
-                        }
-                        else if (fillData->type == 2)
-                        {
-                            sequencer.fillRandomVolume(fillData->fillStep,
-                                                       fillData->from,
-                                                       fillData->to,
-                                                       fillData->density[fillData->fillStep]);
-                        }
-                    }
-                    break;
-                }
-
-                uint8_t fx_index = PTE->editParam == cPatternEditor::EditFx1 ? 1 : 0;
-
-                if (fillData->type == 0)
-                {
-                    sequencer.fillLinearFx(fx_index,
-                                           fillData->fillStep,
-                                           fillData->param,
-                                           fillData->from,
-                                           fillData->from,
-                                           fillData->density[fillData->fillStep]);
-                }
-                else if (fillData->type == 1)
-                {
-                    sequencer.fillLinearFx(fx_index,
-                                           fillData->fillStep,
-                                           fillData->param,
-                                           fillData->from,
-                                           fillData->to,
-                                           fillData->density[fillData->fillStep]);
-                }
-                else if (fillData->type == 2)
-                {
-                    sequencer.fillRandomFx(fx_index,
-                                           fillData->fillStep,
-                                           fillData->param,
-                                           fillData->from,
-                                           fillData->to,
-                                           fillData->density[fillData->fillStep]);
-                }
-
-                break;
-            }
-            default: break;
-        }
+        // Snapshot after applying: the Turing register has advanced and must
+        // persist into the next re-run.
+        s_lastFill = *fillData;
 
         //--------------------------------------------------------
         functFillCancel();
         newFileManager.setActualPatternStructChanged();
+        PTE->showFillAppliedStatus(appliedType);
     }
 }
 
@@ -4436,6 +4606,30 @@ static void functMiniMiddle(uint8_t state)
     {
         return;
     }
+
+#ifdef TRACKER_MINI
+    // Shift+Enter (on the Mini: Shift + middle button) re-runs the last fill,
+    // exactly as it was applied, on the current selection (or on the current
+    // track column when nothing is selected).  Shift+(+/-) is master volume,
+    // so this deliberately only uses the middle button.
+    if (s_fillRerunActive ||
+        (PTE->buttons->isButtonPressed(interfaceButtonShift) &&
+         mtPopups.getStepPopupState() == stepPopupNone))
+    {
+        if (state == buttonPress && !s_fillRerunActive && PTE->editMode == 1 &&
+            !sequencer.isRec() && s_lastFillIdx < 6)
+        {
+            s_fillRerunActive = 1;
+            rerunLastFill();
+        }
+
+        if (state == buttonRelease)
+            s_fillRerunActive = 0;
+
+        if (s_fillRerunActive)
+            return;
+    }
+#endif
 
     // tryb zielony = prewiew stepa
     if (PTE->editMode != 1 && !sequencer.isRec())

@@ -2,6 +2,7 @@
 #include "core/interfacePopups.h"
 #include "fileManager.h"
 #include "mtAudioExport.h"
+#include "mtGenerators.h"
 #include "mtStructs.h"
 #include "patternEditor/patternEditor.h"
 #include "performanceMode/performanceMode.h"
@@ -34,16 +35,31 @@ static const uint16_t framesPopupPlaces[9][4] = {
     { (800 / 8) * 1 + 1, 58, 800 / 4 - 3, 364 },
 };
 
-static const uint8_t fillTypeListCount = 3;
+static const uint8_t fillTypeListCount = 8;
 const char fillTypeListLabels[fillTypeListCount][11] = {
-    "Constant",
-    "From-To",
-    "Random",
+    "Constant", "From-To", "Random", "Walk", "Turing", "Markov", "Prob", "Ratchet",
 };
 const char* ptrfillTypeListNames[fillTypeListCount] = {
     &fillTypeListLabels[0][0],
     &fillTypeListLabels[1][0],
     &fillTypeListLabels[2][0],
+    &fillTypeListLabels[3][0],
+    &fillTypeListLabels[4][0],
+    &fillTypeListLabels[5][0],
+    &fillTypeListLabels[6][0],
+    &fillTypeListLabels[7][0],
+};
+// Names in the order valid for the column currently shown in the popup.
+static const char* ptrFillTypeNamesForColumn[fillTypeListCount];
+//------------------------------------------------------------
+static const uint8_t fillFxSlotCount = 2;
+const char fillFxSlotLabels[fillFxSlotCount][5] = {
+    "FX1",
+    "FX2",
+};
+const char* ptrfillFxSlotNames[fillFxSlotCount] = {
+    &fillFxSlotLabels[0][0],
+    &fillFxSlotLabels[1][0],
 };
 //------------------------------------------------------------
 static const uint8_t fillScaleFilterCount = 2;
@@ -440,15 +456,387 @@ void cPatternEditor::refreshPatternParams()
 }
 
 //##############################################################################################
+//###############################   GENERATIVE FILL HELPERS    #################################
+//##############################################################################################
+
+bool cPatternEditor::fillTypeHasAlt(int16_t type) const
+{
+    return type == fillTypeWalk || type == fillTypeTuring || type == fillTypeMarkov;
+}
+
+bool cPatternEditor::fillStepUsesDensity(int16_t fillStep) const
+{
+    return fillStep >= Sequencer::fillStepRandom;
+}
+
+bool cPatternEditor::fillAltIsRotate(const strFill& fill) const
+{
+    return fillAltActive == fillAltRotate && fill.fillStep == Sequencer::fillStepEuclidean;
+}
+
+bool cPatternEditor::fillAltIsTypeParam(const strFill& fill) const
+{
+    if (!fillTypeHasAlt(fill.type))
+        return false;
+
+    // Without a density selector there is nothing to toggle to, so the type
+    // parameter is always the value shown in this slot.
+    return !fillStepUsesDensity(fill.fillStep) || fillAltActive == fillAltTypeParam;
+}
+
+bool cPatternEditor::fillAltSlotActive(const strFill& fill) const
+{
+    if (!fillStepUsesDensity(fill.fillStep))
+        return fillTypeHasAlt(fill.type);
+    return fillAltIsRotate(fill) || fillAltIsTypeParam(fill);
+}
+
+int16_t cPatternEditor::fillRotateMax() const
+{
+    // Use the editor's live selection: sequencer.selection is only pushed to
+    // the sequencer when the fill is applied.
+    int length = 1;
+    if (trackerPattern.selectState == 2)
+    {
+        if (trackerPattern.selectColumn)
+        {
+            length = sequencer.getPatternLength();
+        }
+        else
+        {
+            int first = trackerPattern.selectStartStep;
+            int last = trackerPattern.selectEndStep;
+            if (first > last)
+            {
+                const int swap = first;
+                first = last;
+                last = swap;
+            }
+            length = last - first + 1;
+        }
+    }
+
+    if (length < 1)
+        length = 1;
+    return (int16_t)(length - 1);
+}
+
+int16_t cPatternEditor::fillDensityMax(int16_t fillStep) const
+{
+    if (fillStep == Sequencer::fillStepEuclidean)
+        return (int16_t)clamp<int>(fillRotateMax() + 1, 1, Sequencer::MAX_FILL_DENSITY);
+    return Sequencer::MAX_FILL_DENSITY;
+}
+
+int16_t* cPatternEditor::fillAltValuePtr(strFill& fill, int16_t& min, int16_t& max) const
+{
+    if (fillAltIsRotate(fill))
+    {
+        min = 0;
+        max = fillRotateMax();
+        return &fill.rotate;
+    }
+
+    const int16_t type = fill.type;
+    min = fillAltMin(type);
+    max = fillAltMax(type);
+    return &fill.genParam[type - fillTypeWalk][3];
+}
+
+void cPatternEditor::toggleFillAlt(const strFill& fill)
+{
+    if (!fillStepUsesDensity(fill.fillStep))
+        return;
+
+    // Cycle through Density/Events, Euclidean Rotate and the type's alternate
+    // parameter, skipping the modes that are not available for this
+    // combination.  The second column always shows the selected mode's name.
+    for (uint8_t i = 1; i <= 3; i++)
+    {
+        const uint8_t mode = (uint8_t)((fillAltActive + i) % 3);
+        if (mode == fillAltDensity ||
+            (mode == fillAltRotate && fill.fillStep == Sequencer::fillStepEuclidean) ||
+            (mode == fillAltTypeParam && fillTypeHasAlt(fill.type)))
+        {
+            fillAltActive = mode;
+            return;
+        }
+    }
+}
+
+int16_t cPatternEditor::fillAltMin(int16_t type) const
+{
+    return type == fillTypeWalk ? 0 : 1;
+}
+
+int16_t cPatternEditor::fillAltMax(int16_t type) const
+{
+    return type == fillTypeWalk ? 24 : 48;
+}
+
+const char* cPatternEditor::fillAltLabel(int16_t type) const
+{
+    return type == fillTypeWalk ? "Max jump" : "Range";
+}
+
+const uint8_t* cPatternEditor::getFillTypesForColumn(uint8_t& count) const
+{
+    static const uint8_t noteTypes[] = { fillTypeConstant, fillTypeFromTo, fillTypeRandom,
+                                         fillTypeWalk,     fillTypeTuring, fillTypeMarkov };
+    static const uint8_t instrTypes[] = { fillTypeConstant, fillTypeFromTo, fillTypeRandom };
+    static const uint8_t fxTypes[] = { fillTypeConstant, fillTypeFromTo, fillTypeRandom,
+                                       fillTypeProb,     fillTypeRatchet };
+
+    if (editParam == EditNote)
+    {
+        count = sizeof(noteTypes) / sizeof(noteTypes[0]);
+        return noteTypes;
+    }
+    if (editParam == EditInstr || isMicVolView)
+    {
+        count = sizeof(instrTypes) / sizeof(instrTypes[0]);
+        return instrTypes;
+    }
+    count = sizeof(fxTypes) / sizeof(fxTypes[0]);
+    return fxTypes;
+}
+
+uint8_t cPatternEditor::fillTypeToDisplayIndex(int16_t type) const
+{
+    uint8_t count = 0;
+    const uint8_t* types = getFillTypesForColumn(count);
+    for (uint8_t i = 0; i < count; i++)
+    {
+        if (types[i] == type)
+            return i;
+    }
+    return 0;
+}
+
+int16_t cPatternEditor::fillTypeFromDisplayIndex(uint8_t index) const
+{
+    uint8_t count = 0;
+    const uint8_t* types = getFillTypesForColumn(count);
+    if (index >= count)
+        index = count - 1;
+    return types[index];
+}
+
+int16_t cPatternEditor::fillValue(const strFill& fill, uint8_t slot) const
+{
+    if (isGenFillType(fill.type))
+    {
+        int typeIdx = fill.type - fillTypeWalk;
+        int paramIdx = (slot == 2) ? 0 : (slot == 4) ? 1 : 2;
+        return fill.genParam[typeIdx][paramIdx];
+    }
+    return (slot == 2) ? fill.param : (slot == 4) ? fill.from : fill.to;
+}
+
+int16_t* cPatternEditor::fillValuePtr(strFill& fill, uint8_t slot, int16_t& min, int16_t& max) const
+{
+    min = 0;
+    max = 0;
+
+    const int16_t type = fill.type;
+    const bool gen = isGenFillType(type);
+    const bool noteColumn = editParam == EditNote;
+    const bool fxColumn = (editParam == EditFx1 || editParam == EditFx2) && !isMicVolView;
+
+    int16_t* ptr = nullptr;
+    if (gen)
+    {
+        int typeIdx = type - fillTypeWalk;
+        int paramIdx = (slot == 2) ? 0 : (slot == 4) ? 1 : 2;
+        ptr = &fill.genParam[typeIdx][paramIdx];
+    }
+    else
+    {
+        ptr = (slot == 2) ? &fill.param : (slot == 4) ? &fill.from : &fill.to;
+    }
+
+    if (noteColumn)
+    {
+        if (slot == 2)
+        {
+            min = 0;
+            max = MAX_SCALE;
+        }
+        else if (slot == 4)
+        {
+            if (type == fillTypeTuring)
+            {
+                min = 1;
+                max = mtGen::kMaxRegisterLength;
+            }
+            else if (type == fillTypeMarkov)
+            {
+                min = 0;
+                max = 1;
+            }
+            else
+            {
+                min = 0;
+                max = 127;
+            }
+        }
+        else
+        {
+            if (type == fillTypeTuring)
+            {
+                min = 0;
+                max = 100;
+            }
+            else if (type == fillTypeMarkov)
+            {
+                min = 1;
+                max = mtGen::kMaxMarkovOrder;
+            }
+            else
+            {
+                min = 0;
+                max = 127;
+            }
+        }
+    }
+    else if (fxColumn)
+    {
+        if (type == fillTypeProb || type == fillTypeRatchet)
+        {
+            if (slot == 2)
+            {
+                min = 0;
+                max = 1; // FX1 / FX2 target slot
+            }
+            else if (slot == 4)
+            {
+                min = 0;
+                max = mtGen::kChanceProbMax;
+            }
+            else
+            {
+                if (type == fillTypeRatchet)
+                {
+                    min = mtGen::kRollPeriodMin;
+                    max = mtGen::kRollPeriodMax;
+                }
+                else
+                {
+                    min = 0;
+                    max = Sequencer::MAXSTEP;
+                }
+            }
+        }
+        else
+        {
+            if (slot == 2)
+            {
+                // param == -1 means "random FX" in the legacy fill helpers.
+                min = -1;
+                max = FX_COUNT - 1 - FX_COUNT_HIDDEN_FXes;
+            }
+            else
+            {
+                int16_t fxId = interfaceGlobals.fxIDs[clamp<int>(fill.param, 0, FX_COUNT - 1)];
+                min = sequencer.getFxMin(fxId);
+                max = sequencer.getFxMax(fxId);
+            }
+        }
+    }
+    else if (editParam == EditInstr)
+    {
+        min = 0;
+        max = kTotalInstrumentsCount - 1;
+    }
+    else
+    {
+        min = 0;
+        max = 100;
+    }
+
+    return ptr;
+}
+
+const char* cPatternEditor::fillValueLabel(int16_t type, uint8_t slot) const
+{
+    if (slot == 4)
+    {
+        if (editParam == EditNote)
+        {
+            if (type == fillTypeTuring)
+                return "Length";
+            if (type == fillTypeMarkov)
+                return "Source";
+            if (type == fillTypeConstant)
+                return "Note";
+            return "From";
+        }
+        if (editParam == EditInstr)
+            return type == fillTypeConstant ? "Instrument" : "From";
+        if (editParam == EditFx1 || editParam == EditFx2)
+        {
+            if (type == fillTypeProb || type == fillTypeRatchet)
+                return "Prob %";
+            if (isMicVolView)
+                return editParam == EditFx1 ? "Micro-move" : "Volume";
+            return "Fx Value";
+        }
+    }
+    else if (slot == 5)
+    {
+        if (editParam == EditNote)
+        {
+            if (type == fillTypeTuring)
+                return "Lock";
+            if (type == fillTypeMarkov)
+                return "Order";
+            return "To";
+        }
+        if (editParam == EditInstr)
+            return "To";
+        if (editParam == EditFx1 || editParam == EditFx2)
+        {
+            if (type == fillTypeProb || type == fillTypeRatchet)
+                return "Count";
+            if (isMicVolView)
+                return editParam == EditFx1 ? "Micro-move" : "Volume";
+            return "To";
+        }
+    }
+    return "";
+}
+
+const char* cPatternEditor::fillTypeName(int16_t type) const
+{
+    if (type < 0 || type >= fillTypeCount)
+        return "?";
+    return &fillTypeListLabels[type][0];
+}
+
+void cPatternEditor::showFillAppliedStatus(int16_t type)
+{
+    char text[20];
+    snprintf(text, sizeof(text), "Fill: %s", fillTypeName(type));
+
+    display.setControlText(label[7], text);
+    display.setControlText2(label[7], "undo");
+    display.setControlValue(label[7], 1);
+    display.refreshControl(label[7]);
+    display.synchronizeRefresh();
+}
+
+//##############################################################################################
 //###############################             FILL             #################################
 //##############################################################################################
 
 void cPatternEditor::showFillNote()
 {
+    uint8_t fillIdx = getFillDataIdx();
+
     // scale
     fillScaleFilterList.linesCount = 13;
-    fillScaleFilterList.start = fillData[editParam].param;
-    fillScaleFilterList.length = MAX_SCALE;
+    fillScaleFilterList.start = fillValue(fillData[fillIdx], 2);
+    fillScaleFilterList.length = MAX_SCALE + 1;
     fillScaleFilterList.data = (char**)(&scaleNames);
     fillScaleFilterList.lineWidthMax = 800 / 8 - 30;
     fillScaleFilterList.lineTextLenMax = 15;
@@ -549,15 +937,38 @@ void cPatternEditor::showFillMicVol()
 
 void cPatternEditor::showFillFx()
 {
-    // fx
-    fillFxTypeList.linesCount = 13;
-    fillFxTypeList.start = fillData[editParam].param + 1;
-    fillFxTypeList.length = FX_COUNT + 1 - FX_COUNT_HIDDEN_FXes;
-    fillFxTypeList.data = (char**)(&interfaceGlobals.ptrAllFxNamesShort);
-    fillFxTypeList.lineWidthMax = 800 / 8 - 30;
-    fillFxTypeList.lineTextLenMax = 15;
+    uint8_t fillIdx = getFillDataIdx();
+    int16_t type = fillData[fillIdx].type;
 
-    display.setControlData(param2PopupListControl, &fillFxTypeList);
+    if (type == fillTypeProb || type == fillTypeRatchet)
+    {
+        // Prob / Ratchet write a known FX code; slot 2 chooses the target
+        // FX column instead of an arbitrary FX type.
+        fillFxSlotList.linesCount = fillFxSlotCount;
+        fillFxSlotList.start = fillValue(fillData[fillIdx], 2);
+        fillFxSlotList.length = fillFxSlotCount;
+        fillFxSlotList.data = (char**)(&ptrfillFxSlotNames);
+        fillFxSlotList.lineWidthMax = 800 / 8 - 30;
+        fillFxSlotList.lineTextLenMax = 5;
+
+        display.setControlData(param2PopupListControl, &fillFxSlotList);
+
+        display.setControlValue(label[2], 0);
+        display.setControlText(label[2], "FX");
+        display.setControlText2(label[2], "");
+    }
+    else
+    {
+        // fx
+        fillFxTypeList.linesCount = 13;
+        fillFxTypeList.start = fillData[fillIdx].param + 1;
+        fillFxTypeList.length = FX_COUNT + 1 - FX_COUNT_HIDDEN_FXes;
+        fillFxTypeList.data = (char**)(&interfaceGlobals.ptrAllFxNamesShort);
+        fillFxTypeList.lineWidthMax = 800 / 8 - 30;
+        fillFxTypeList.lineTextLenMax = 15;
+
+        display.setControlData(param2PopupListControl, &fillFxTypeList);
+    }
 
     refreshFillParam();
     refreshFillFrom();
@@ -567,6 +978,11 @@ void cPatternEditor::showFillFx()
 void cPatternEditor::showFillPopup()
 {
     uint8_t fillIdx = getFillDataIdx();
+
+    // Density selectors always open on Events; the alternate values (Rotate /
+    // Max jump / Range) are one press of the second column away.
+    if (fillStepUsesDensity(fillData[fillIdx].fillStep))
+        fillAltActive = fillAltDensity;
 
     if (fillData[fillIdx].type == 0)
     {
@@ -611,16 +1027,21 @@ void cPatternEditor::showFillPopup()
     display.setControlText2(label[0], "");
 
     // typ
-    fillTypeList.linesCount = fillTypeListCount;
-    fillTypeList.start = fillData[fillIdx].type;
-    fillTypeList.length = fillTypeListCount;
-    fillTypeList.data = (char**)(&ptrfillTypeListNames);
+    uint8_t fillTypeCountForColumn = 0;
+    const uint8_t* fillTypeIds = getFillTypesForColumn(fillTypeCountForColumn);
+    for (uint8_t i = 0; i < fillTypeCountForColumn; i++)
+        ptrFillTypeNamesForColumn[i] = ptrfillTypeListNames[fillTypeIds[i]];
+
+    fillTypeList.linesCount = fillTypeCountForColumn;
+    fillTypeList.start = fillTypeToDisplayIndex(fillData[fillIdx].type);
+    fillTypeList.length = fillTypeCountForColumn;
+    fillTypeList.data = (char**)(&ptrFillTypeNamesForColumn);
     fillTypeList.lineWidthMax = 800 / 8 - 30;
     fillTypeList.lineTextLenMax = 11;
 
     display.setControlPosition(param1PopupListControl, (800 / 8) * (3) + 1, -1);
     display.setControlData(param1PopupListControl, &fillTypeList);
-    display.setControlValue(param1PopupListControl, fillData[fillIdx].type);
+    display.setControlValue(param1PopupListControl, fillTypeToDisplayIndex(fillData[fillIdx].type));
 
     display.setControlText(label[3], "Fill Type");
     display.setControlValue(label[3], 0);
@@ -746,101 +1167,30 @@ void cPatternEditor::showFillPopup()
 void cPatternEditor::refreshFillType()
 {
     uint8_t fillIdx = getFillDataIdx();
+    int16_t type = fillData[fillIdx].type;
 
-    display.setControlValue(param1PopupListControl, fillData[fillIdx].type);
+    display.setControlValue(param1PopupListControl, fillTypeToDisplayIndex(type));
     display.refreshControl(param1PopupListControl);
 
     fillText1[0] = 0;
     fillText2[0] = 0;
 
-    if (fillData[fillIdx].type == 0)
+    display.setControlText(label[4], fillValueLabel(type, 4));
+    display.setControlText(label[5], fillValueLabel(type, 5));
+    display.setControlValue(label[4], 1);
+    display.setControlValue(label[5], 1);
+
+    if (type == fillTypeConstant)
     {
         display.setControlValue(val2PopupBar, -1);
         display.setControlText(label[5], "");
         display.setControlText2(label[5], "");
     }
-    else
-    {
-        display.setControlText(label[4], "From");
-        display.setControlText(label[5], "To");
-    }
 
-    if (editParam == EditNote)
-    {
-        display.setControlText2(label[4], (char*)&mtNotes[fillData[fillIdx].from][0]);
-        display.setControlValue(val1PopupBar, (fillData[fillIdx].from * 100) / (127));
-
-        if (fillData[fillIdx].type == 0)
-        {
-            display.setControlText(label[4], "Note");
-        }
-        else
-        {
-            display.setControlValue(val2PopupBar, (fillData[fillIdx].to * 100) / (127));
-            display.setControlText2(label[5], (char*)&mtNotes[fillData[fillIdx].to][0]);
-        }
-    }
-    else if (editParam == EditInstr)
-    {
-        if (fillData[fillIdx].from < kSampleInstrumentsCount)
-            sprintf(fillText1, "%d", (fillData[fillIdx].from + 1));
-        else
-            sprintf(fillText1, "%d", (fillData[fillIdx].from + 3));
-        display.setControlText2(label[4], fillText1);
-        display.setControlValue(intstrumentsFromPopupListControl, fillData[fillIdx].from);
-
-        if (fillData[fillIdx].type == 0)
-        {
-            display.setControlText(label[4], "Instrument");
-        }
-        else
-        {
-            if (fillData[fillIdx].to < kSampleInstrumentsCount)
-                sprintf(fillText2, "%d", (fillData[fillIdx].to + 1));
-            else
-                sprintf(fillText2, "%d", (fillData[fillIdx].to + 3));
-            display.setControlText2(label[5], fillText2);
-            display.setControlValue(intstrumentsToPopupListControl, fillData[fillIdx].to);
-        }
-    }
-    else if (editParam == EditFx1 || editParam == EditFx2)
-    {
-        sprintf(fillText1, "%d", (fillData[fillIdx].from));
-        display.setControlText2(label[4], fillText1);
-
-        if (isMicVolView)
-        {
-            display.setControlValue(val1PopupBar, fillData[fillIdx].from);
-            if (fillData[fillIdx].type == 0)
-            {
-                display.setControlText(label[4], editParam == EditFx1 ? "Micro-move" : "Volume");
-            }
-            else
-            {
-                sprintf(fillText2, "%d", (fillData[fillIdx].to));
-                display.setControlText2(label[5], fillText2);
-                display.setControlValue(val2PopupBar, fillData[fillIdx].to);
-            }
-        }
-        else
-        {
-            display.setControlValue(val1PopupBar, (fillData[fillIdx].from * 100) / (255));
-
-            if (fillData[fillIdx].type == 0)
-            {
-                display.setControlText(label[4], "Fx Value");
-            }
-            else
-            {
-                sprintf(fillText2, "%d", (fillData[fillIdx].to));
-                display.setControlText2(label[5], fillText2);
-                display.setControlValue(val2PopupBar, (fillData[fillIdx].to * 100) / (255));
-            }
-        }
-    }
-
+    refreshFillParam();
     refreshFillFrom();
     refreshFillTo();
+    refreshFillDensity();
 
     display.refreshControl(val1PopupBar);
     display.refreshControl(val2PopupBar);
@@ -854,71 +1204,79 @@ void cPatternEditor::refreshFillType()
 void cPatternEditor::refreshFillFrom()
 {
     uint8_t fillIdx = getFillDataIdx();
+    int16_t type = fillData[fillIdx].type;
+
+    int16_t min = 0;
+    int16_t max = 0;
+    int16_t* stored = fillValuePtr(fillData[fillIdx], 4, min, max);
+    int16_t value = clamp<int>(*stored, min, max);
+    *stored = value;
 
     fillText1[0] = 0;
+    display.setControlText(label[4], fillValueLabel(type, 4));
+
     if (editParam == EditNote)
     {
-        display.setControlText2(label[4], (char*)&mtNotes[fillData[fillIdx].from][0]);
-        display.setControlValue(val1PopupBar, (fillData[fillIdx].from * 100) / (127));
+        if (type == fillTypeTuring)
+        {
+            sprintf(fillText1, "%d", value);
+            display.setControlText2(label[4], fillText1);
+            display.setControlValue(
+              val1PopupBar, (value - 1) * 100 / (mtGen::kMaxRegisterLength - 1));
+        }
+        else if (type == fillTypeMarkov)
+        {
+            display.setControlText2(label[4], value ? "Track" : "Sel");
+            display.setControlValue(val1PopupBar, value ? 100 : 0);
+        }
+        else
+        {
+            display.setControlText2(label[4], (char*)&mtNotes[value][0]);
+            display.setControlValue(val1PopupBar, (value * 100) / (127));
+        }
     }
     else if (editParam == EditInstr)
     {
-        if (fillData[fillIdx].from < kSampleInstrumentsCount)
-            sprintf(fillText1, "%d", (fillData[fillIdx].from + 1));
+        if (value < kSampleInstrumentsCount)
+            sprintf(fillText1, "%d", (value + 1));
         else
-            sprintf(fillText1, "%d", (fillData[fillIdx].from + 3));
+            sprintf(fillText1, "%d", (value + 3));
         display.setControlText2(label[4], fillText1);
         display.refreshControl(label[4]);
 
         display.setControlHide(val1PopupBar);
         display.setControlShow(intstrumentsFromPopupListControl);
-        display.setControlValue(intstrumentsFromPopupListControl, fillData[fillIdx].from);
+        display.setControlValue(intstrumentsFromPopupListControl, value);
         display.refreshControl(intstrumentsFromPopupListControl);
     }
     else if (editParam == EditFx1 || editParam == EditFx2)
     {
-        if (isMicVolView)
+        if (type == fillTypeProb || type == fillTypeRatchet)
         {
-            if (fillData[fillIdx].from < 0)
-                fillData[fillIdx].from = 0;
-            if (fillData[fillIdx].from > 100)
-                fillData[fillIdx].from = 100;
-
+            sprintf(fillText1, "%d", value);
+            display.setControlText2(label[4], fillText1);
+            display.setControlValue(val1PopupBar, (value * 100) / mtGen::kChanceProbMax);
+        }
+        else if (isMicVolView)
+        {
             uint8_t fxType = editParam == EditFx1 ? sequencer.fx.FX_TYPE_MICROMOVE
                                                   : sequencer.fx.FX_TYPE_VOLUME;
-            sequencer.makeFxValLabelWithAlgin(fillText1,
-                                              fillTextLen,
-                                              fxType,
-                                              fillData[fillIdx].from,
-                                              Sequencer::fxValLabelAlign_center);
+            sequencer.makeFxValLabelWithAlgin(
+              fillText1, fillTextLen, fxType, value, Sequencer::fxValLabelAlign_center);
             display.setControlText2(label[4], fillText1);
-            display.setControlValue(val1PopupBar, fillData[fillIdx].from);
+            display.setControlValue(val1PopupBar, value);
         }
         else
         {
-            int16_t min_fx = sequencer.getFxMin(interfaceGlobals.fxIDs[fillData[fillIdx].param]);
-
-            int16_t max_fx = sequencer.getFxMax(interfaceGlobals.fxIDs[fillData[fillIdx].param]);
-
-            if (fillData[fillIdx].from < min_fx)
-                fillData[fillIdx].from = min_fx;
-            if (fillData[fillIdx].from > max_fx)
-                fillData[fillIdx].from = max_fx;
-
-            //		int16_t valToView = sequencer.getFxValueCorrection(
-            //				interfaceGlobals.fxIDs[fillData[editParam].param],
-            //				fillData[editParam].from);
-
             sequencer.makeFxValLabelWithAlgin(fillText1,
                                               fillTextLen,
                                               interfaceGlobals.fxIDs[fillData[fillIdx].param],
-                                              fillData[fillIdx].from,
+                                              value,
                                               Sequencer::fxValLabelAlign_center);
 
             display.setControlText2(label[4], fillText1);
 
-            display.setControlValue(val1PopupBar,
-                                    ((fillData[fillIdx].from - min_fx) * 100) / (max_fx - min_fx));
+            display.setControlValue(val1PopupBar, ((value - min) * 100) / (max - min));
         }
     }
 
@@ -930,10 +1288,12 @@ void cPatternEditor::refreshFillFrom()
 void cPatternEditor::refreshFillTo()
 {
     uint8_t fillIdx = getFillDataIdx();
+    int16_t type = fillData[fillIdx].type;
 
     fillText2[0] = 0;
+    display.setControlText(label[5], fillValueLabel(type, 5));
 
-    if (fillData[fillIdx].type == 0)
+    if (type == fillTypeConstant)
     {
         display.setControlText(label[5], "");
         display.setControlText2(label[5], "");
@@ -947,74 +1307,81 @@ void cPatternEditor::refreshFillTo()
         return;
     }
 
+    int16_t min = 0;
+    int16_t max = 0;
+    int16_t* stored = fillValuePtr(fillData[fillIdx], 5, min, max);
+    int16_t value = clamp<int>(*stored, min, max);
+    *stored = value;
+
     if (editParam == EditNote)
     {
-        display.setControlText2(label[5], (char*)&mtNotes[fillData[fillIdx].to][0]);
-        display.setControlValue(val2PopupBar, (fillData[fillIdx].to * 100) / (127));
+        if (type == fillTypeTuring)
+        {
+            sprintf(fillText2, "%d", value);
+            display.setControlText2(label[5], fillText2);
+            display.setControlValue(val2PopupBar, value);
+        }
+        else if (type == fillTypeMarkov)
+        {
+            sprintf(fillText2, "%d", value);
+            display.setControlText2(label[5], fillText2);
+            display.setControlValue(val2PopupBar,
+                                    (value - 1) * 100 / (mtGen::kMaxMarkovOrder - 1));
+        }
+        else
+        {
+            display.setControlText2(label[5], (char*)&mtNotes[value][0]);
+            display.setControlValue(val2PopupBar, (value * 100) / (127));
+        }
         display.refreshControl(label[5]);
     }
     else if (editParam == EditInstr)
     {
-        if (fillData[fillIdx].to < kSampleInstrumentsCount)
-            sprintf(fillText2, "%d", (fillData[fillIdx].to + 1));
+        if (value < kSampleInstrumentsCount)
+            sprintf(fillText2, "%d", (value + 1));
         else
-            sprintf(fillText2, "%d", (fillData[fillIdx].to + 3));
+            sprintf(fillText2, "%d", (value + 3));
         display.setControlText2(label[5], fillText2);
         display.refreshControl(label[5]);
 
         display.setControlHide(val2PopupBar);
         display.setControlShow(intstrumentsToPopupListControl);
         display.setControlData(intstrumentsToPopupListControl, &fillInstrumentsToList);
-        display.setControlValue(intstrumentsToPopupListControl, fillData[fillIdx].to);
+        display.setControlValue(intstrumentsToPopupListControl, value);
         display.refreshControl(intstrumentsToPopupListControl);
     }
     else if (editParam == EditFx1 || editParam == EditFx2)
     {
-        if (isMicVolView)
+        if (type == fillTypeProb || type == fillTypeRatchet)
         {
-            if (fillData[fillIdx].to < 0)
-                fillData[fillIdx].to = 0;
-            if (fillData[fillIdx].to > 100)
-                fillData[fillIdx].to = 100;
-
+            sprintf(fillText2, "%d", value);
+            display.setControlText2(label[5], fillText2);
+            display.setControlValue(val2PopupBar,
+                                    max > min ? ((value - min) * 100) / (max - min) : 0);
+            display.refreshControl(label[5]);
+        }
+        else if (isMicVolView)
+        {
             uint8_t fxType = editParam == EditFx1 ? sequencer.fx.FX_TYPE_MICROMOVE
                                                   : sequencer.fx.FX_TYPE_VOLUME;
-            sequencer.makeFxValLabelWithAlgin(fillText2,
-                                              fillTextLen,
-                                              fxType,
-                                              fillData[fillIdx].to,
-                                              Sequencer::fxValLabelAlign_center);
+            sequencer.makeFxValLabelWithAlgin(
+              fillText2, fillTextLen, fxType, value, Sequencer::fxValLabelAlign_center);
             display.setControlText2(label[5], fillText2);
-            display.setControlValue(val2PopupBar, fillData[fillIdx].to);
+            display.setControlValue(val2PopupBar, value);
             display.refreshControl(label[5]);
         }
         else
         {
-            int16_t min_fx = sequencer.getFxMin(interfaceGlobals.fxIDs[fillData[fillIdx].param]);
-            int16_t max_fx = sequencer.getFxMax(interfaceGlobals.fxIDs[fillData[fillIdx].param]);
-
-            if (fillData[fillIdx].to < min_fx)
-                fillData[fillIdx].to = min_fx;
-            if (fillData[fillIdx].to > max_fx)
-                fillData[fillIdx].to = max_fx;
-
-            //		int16_t valToView = sequencer.getFxValueCorrection(
-            //				interfaceGlobals.fxIDs[fillData[editParam].param],
-            //				fillData[editParam].to);
-            //
-            //		sprintf(fillText2, "%d", (valToView));
-            //
-
             sequencer.makeFxValLabelWithAlgin(fillText2,
                                               fillTextLen,
                                               interfaceGlobals.fxIDs[fillData[fillIdx].param],
-                                              fillData[fillIdx].to,
+                                              value,
                                               Sequencer::fxValLabelAlign_center);
 
             display.setControlText2(label[5], fillText2);
 
             display.setControlValue(val2PopupBar,
-                                    ((fillData[fillIdx].to - min_fx) * 100) / (max_fx - min_fx));
+                                    max > min ? ((value - min) * 100) / (max - min) : 0);
             display.refreshControl(label[5]);
         }
     }
@@ -1025,57 +1392,135 @@ void cPatternEditor::refreshFillTo()
 
 void cPatternEditor::refreshFillParam()
 {
+    uint8_t fillIdx = getFillDataIdx();
+    int16_t type = fillData[fillIdx].type;
+
     if (editParam == EditNote)
     {
-        display.setControlValue(param2PopupListControl, fillData[editParam].param);
+        int16_t min = 0;
+        int16_t max = 0;
+        int16_t* stored = fillValuePtr(fillData[fillIdx], 2, min, max);
+        *stored = clamp<int>(*stored, min, max);
+
+        // Re-point the slot 2 list every time: the type (and therefore the
+        // meaning of this slot) can change while the popup is open.
+        fillScaleFilterList.linesCount = 13;
+        fillScaleFilterList.start = *stored;
+        fillScaleFilterList.length = MAX_SCALE + 1;
+        fillScaleFilterList.data = (char**)(&scaleNames);
+        fillScaleFilterList.lineWidthMax = 800 / 8 - 30;
+        fillScaleFilterList.lineTextLenMax = 15;
+        display.setControlData(param2PopupListControl, &fillScaleFilterList);
+
+        display.setControlValue(param2PopupListControl, *stored);
         display.setControlShow(param2PopupListControl);
+        display.setControlValue(label[2], 1);
+        display.setControlText(label[2], "Scale");
+        display.setControlText2(label[2], "");
+        display.refreshControl(label[2]);
         display.refreshControl(param2PopupListControl);
     }
     else if ((editParam == EditFx1 || editParam == EditFx2) && !isMicVolView)
     {
-        display.setControlValue(param2PopupListControl, fillData[editParam].param + 1);
-        display.setControlShow(param2PopupListControl);
-        display.refreshControl(param2PopupListControl);
+        if (type == fillTypeProb || type == fillTypeRatchet)
+        {
+            int16_t min = 0;
+            int16_t max = 0;
+            int16_t* stored = fillValuePtr(fillData[fillIdx], 2, min, max);
+            *stored = clamp<int>(*stored, min, max);
 
-        display.setControlValue(label[2], 1);
-        display.setControlText(label[2], "Fx Type");
-        fxTypeText[0] = interfaceGlobals.ptrAllFxNames[fillData[editParam].param + 1][0];
-        fxTypeText[1] = 0;
-        display.setControlText2(label[2], fxTypeText);
-        display.refreshControl(label[2]);
+            fillFxSlotList.linesCount = fillFxSlotCount;
+            fillFxSlotList.start = *stored;
+            fillFxSlotList.length = fillFxSlotCount;
+            fillFxSlotList.data = (char**)(&ptrfillFxSlotNames);
+            fillFxSlotList.lineWidthMax = 800 / 8 - 30;
+            fillFxSlotList.lineTextLenMax = 5;
+            display.setControlData(param2PopupListControl, &fillFxSlotList);
 
-        refreshFillFrom();
-        refreshFillTo();
+            display.setControlValue(param2PopupListControl, *stored);
+            display.setControlShow(param2PopupListControl);
+            display.refreshControl(param2PopupListControl);
+
+            display.setControlValue(label[2], 1);
+            display.setControlText(label[2], "FX");
+            display.setControlText2(label[2], *stored == 0 ? "FX1" : "FX2");
+            display.refreshControl(label[2]);
+        }
+        else
+        {
+            fillFxTypeList.linesCount = 13;
+            fillFxTypeList.start = fillData[fillIdx].param + 1;
+            fillFxTypeList.length = FX_COUNT + 1 - FX_COUNT_HIDDEN_FXes;
+            fillFxTypeList.data = (char**)(&interfaceGlobals.ptrAllFxNamesShort);
+            fillFxTypeList.lineWidthMax = 800 / 8 - 30;
+            fillFxTypeList.lineTextLenMax = 15;
+            display.setControlData(param2PopupListControl, &fillFxTypeList);
+
+            display.setControlValue(param2PopupListControl, fillData[fillIdx].param + 1);
+            display.setControlShow(param2PopupListControl);
+            display.refreshControl(param2PopupListControl);
+
+            display.setControlValue(label[2], 1);
+            display.setControlText(label[2], "Fx Type");
+            fxTypeText[0] = interfaceGlobals.ptrAllFxNames[fillData[fillIdx].param + 1][0];
+            fxTypeText[1] = 0;
+            display.setControlText2(label[2], fxTypeText);
+            display.refreshControl(label[2]);
+
+            refreshFillFrom();
+            refreshFillTo();
+        }
     }
 }
 
 void cPatternEditor::refreshFillDensity()
 {
     uint8_t fillIdx = getFillDataIdx();
+    strFill& fill = fillData[fillIdx];
+
+    if (fillAltSlotActive(fill))
+    {
+        int16_t min = 0;
+        int16_t max = 0;
+        int16_t* stored = fillAltValuePtr(fill, min, max);
+        int16_t value = clamp<int>(*stored, min, max);
+        *stored = value;
+
+        sprintf(fillTextDensity, "%d", value);
+        display.setControlText(label[1],
+                               fillAltIsRotate(fill) ? "Rotate" : fillAltLabel(fill.type));
+        display.setControlText2(label[1], fillTextDensity);
+        display.refreshControl(label[1]);
+        display.setControlValue(val3PopupBar, max > min ? (value - min) * 100 / (max - min) : 0);
+        display.refreshControl(val3PopupBar);
+        return;
+    }
+
     const char* labelText = nullptr;
-    int value;
-    switch (fillData[fillIdx].fillStep)
+    int value = 0;
+    switch (fill.fillStep)
     {
         case Sequencer::fillStepRandom:
             labelText = "Density";
-            value = fillData[fillIdx].density[fillData[fillIdx].fillStep] * 100 /
-                    Sequencer::MAX_FILL_DENSITY;
+            value = fill.density[fill.fillStep] * 100 / Sequencer::MAX_FILL_DENSITY;
             sprintf(fillTextDensity, "%d %%", value);
             break;
         case Sequencer::fillStepByStep:
             labelText = "Step";
-            value = fillData[fillIdx].density[fillData[fillIdx].fillStep] * 100 /
-                    Sequencer::MAX_FILL_DENSITY;
-            sprintf(
-              fillTextDensity, "%d", fillData[fillIdx].density[fillData[fillIdx].fillStep]);
+            value = fill.density[fill.fillStep] * 100 / Sequencer::MAX_FILL_DENSITY;
+            sprintf(fillTextDensity, "%d", fill.density[fill.fillStep]);
             break;
         case Sequencer::fillStepEuclidean:
+        {
             labelText = "Events";
-            value = fillData[fillIdx].density[fillData[fillIdx].fillStep] * 100 /
-                    Sequencer::MAX_FILL_DENSITY;
-            sprintf(
-              fillTextDensity, "%d", fillData[fillIdx].density[fillData[fillIdx].fillStep]);
+            const int maxEvents = fillDensityMax(fill.fillStep);
+            fill.density[fill.fillStep] =
+              clamp<int>(fill.density[fill.fillStep], 1, maxEvents);
+            value = maxEvents > 1 ? (fill.density[fill.fillStep] - 1) * 100 / (maxEvents - 1)
+                                  : 100;
+            sprintf(fillTextDensity, "%d", fill.density[fill.fillStep]);
             break;
+        }
         default: break;
     }
     if (labelText != nullptr)

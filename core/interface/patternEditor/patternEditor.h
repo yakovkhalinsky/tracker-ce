@@ -288,6 +288,8 @@ class cPatternEditor : public ModuleBase
     //
     strList fillFxTypeList;
     //
+    strList fillFxSlotList;
+    //
     strList fillEmptyList;
     //
     strList fillStepList;
@@ -301,6 +303,27 @@ class cPatternEditor : public ModuleBase
     char fillTextDensity[10];
     char fxTypeText[2];
     //
+    enum enFillType
+    {
+        fillTypeConstant = 0,
+        fillTypeFromTo,
+        fillTypeRandom,
+        fillTypeWalk,
+        fillTypeTuring,
+        fillTypeMarkov,
+        fillTypeProb,
+        fillTypeRatchet,
+        fillTypeCount
+    };
+    static constexpr int fillGenTypeCount = fillTypeCount - fillTypeWalk;
+
+    enum enFillAltMode
+    {
+        fillAltDensity = 0, // the step selector's Events count
+        fillAltRotate,      // Euclidean rotate (only for the Euclidean selector)
+        fillAltTypeParam,   // Max jump / Range for Walk / Turing / Markov
+    };
+
     struct strFill
     {
         int16_t fillStep;
@@ -309,6 +332,22 @@ class cPatternEditor : public ModuleBase
         int16_t to;
         int16_t param;
         int16_t density[Sequencer::fillStepEnd__];
+
+        // Settings remembered per generated type (index: type - fillTypeWalk)
+        // and per fill column (fillData[6]).
+        //   [0] = popup slot 2 (Scale / FX slot)
+        //   [1] = popup slot 4 (From / Length / Source / Prob %)
+        //   [2] = popup slot 5 (To / Lock / Order / Count)
+        //   [3] = popup slot 1 alternate (Max jump / Range)
+        int16_t genParam[fillGenTypeCount][4];
+
+        // Turing register survives between runs (RAM only, never saved).
+        uint16_t turingReg;
+        // Euclidean rotate, 0..selection length-1 (RAM only, never saved).
+        // Kept here because it fits the struct's alignment padding.
+        int16_t rotate;
+        uint32_t turingRng;
+        uint8_t turingSeeded;
     };
     static strFill fillData[6];
     uint8_t getFillDataIdx() const
@@ -316,6 +355,32 @@ class cPatternEditor : public ModuleBase
         return (isMicVolView && editParam >= EditFx1) ? (editParam + 2) : editParam;
     }
     void initExternalRamState();
+
+    //--- generative fill helpers -------------------------------------------
+    bool isGenFillType(int16_t type) const { return type >= fillTypeWalk && type < fillTypeCount; }
+    bool fillTypeHasAlt(int16_t type) const;
+    bool fillStepUsesDensity(int16_t fillStep) const;
+    bool fillAltSlotActive(const strFill& fill) const;
+    bool fillAltIsRotate(const strFill& fill) const;
+    bool fillAltIsTypeParam(const strFill& fill) const;
+    int16_t fillAltMin(int16_t type) const;
+    int16_t fillAltMax(int16_t type) const;
+    const char* fillAltLabel(int16_t type) const;
+    int16_t fillRotateMax() const;
+    int16_t fillDensityMax(int16_t fillStep) const;
+    int16_t* fillAltValuePtr(strFill& fill, int16_t& min, int16_t& max) const;
+    void toggleFillAlt(const strFill& fill);
+    const uint8_t* getFillTypesForColumn(uint8_t& count) const;
+    uint8_t fillTypeToDisplayIndex(int16_t type) const;
+    int16_t fillTypeFromDisplayIndex(uint8_t index) const;
+    int16_t* fillValuePtr(strFill& fill, uint8_t slot, int16_t& min, int16_t& max) const;
+    int16_t fillValue(const strFill& fill, uint8_t slot) const;
+    const char* fillValueLabel(int16_t type, uint8_t slot) const;
+    const char* fillTypeName(int16_t type) const;
+    void showFillAppliedStatus(int16_t type);
+
+    // Which value the second popup column edits: enFillAltMode.
+    uint8_t fillAltActive = fillAltDensity;
 
     bool isMicVolView = false;
     bool toggledMicVolOnPress = false;

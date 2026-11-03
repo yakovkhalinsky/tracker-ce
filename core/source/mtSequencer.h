@@ -834,43 +834,97 @@ class Sequencer
     void setStepRepeater(uint8_t track, int8_t stepRepeat);
     void setPerformancePlayMode(uint8_t track, int8_t playmode);
 
-    void fillRandomNotes(int16_t, int16_t, int16_t, int16_t, int16_t);
-    void fillLinearNotes(int16_t, int16_t, int16_t, int16_t, int16_t);
-    void fillRandomInstruments(int16_t step, int16_t from, int16_t to, int16_t density);
-    void fillLinearInstruments(int16_t step, int16_t from, int16_t to, int16_t density);
+    void fillRandomNotes(int16_t, int16_t, int16_t, int16_t, int16_t, int16_t);
+    void fillLinearNotes(int16_t, int16_t, int16_t, int16_t, int16_t, int16_t);
+    void fillRandomInstruments(
+      int16_t step, int16_t from, int16_t to, int16_t density, int16_t rotate);
+    void fillLinearInstruments(
+      int16_t step, int16_t from, int16_t to, int16_t density, int16_t rotate);
     void fillLinearFx(int16_t index,
                       int16_t fillStep,
                       int16_t fxType,
                       int16_t fromVal,
                       int16_t toVal,
-                      int16_t density);
+                      int16_t density,
+                      int16_t rotate);
     void fillRandomFx(int16_t index,
                       int16_t fillStep,
                       int16_t fxType,
                       int16_t fromVal,
                       int16_t toVal,
-                      int16_t density);
-    void fillLinearMicromove(int16_t fillStep, int16_t fromVal, int16_t toVal, int16_t density);
-    void fillRandomMicromove(int16_t fillStep, int16_t fromVal, int16_t toVal, int16_t density);
-    void fillLinearVolume(int16_t fillStep, int16_t fromVal, int16_t toVal, int16_t density);
-    void fillRandomVolume(int16_t fillStep, int16_t fromVal, int16_t toVal, int16_t density);
+                      int16_t density,
+                      int16_t rotate);
+    void fillLinearMicromove(
+      int16_t fillStep, int16_t fromVal, int16_t toVal, int16_t density, int16_t rotate);
+    void fillRandomMicromove(
+      int16_t fillStep, int16_t fromVal, int16_t toVal, int16_t density, int16_t rotate);
+    void fillLinearVolume(
+      int16_t fillStep, int16_t fromVal, int16_t toVal, int16_t density, int16_t rotate);
+    void fillRandomVolume(
+      int16_t fillStep, int16_t fromVal, int16_t toVal, int16_t density, int16_t rotate);
 
-    bool isEuclideanStep(uint8_t offset, int16_t density);
+    // Generative fill adapters (algorithms live in core/source/mtGenerators.*)
+    void fillWalkNotes(int16_t fillStep,
+                       int16_t scale,
+                       int16_t from,
+                       int16_t to,
+                       int16_t maxJump,
+                       int16_t density,
+                       int16_t rotate);
+    void fillTuringNotes(int16_t fillStep,
+                         int16_t scale,
+                         int16_t range,
+                         int16_t length,
+                         int16_t lock,
+                         int16_t density,
+                         int16_t rotate,
+                         uint16_t* reg,
+                         uint32_t* rngState,
+                         uint8_t* seeded);
+    void fillMarkovNotes(int16_t fillStep,
+                         int16_t scale,
+                         int16_t sourceMode,
+                         int16_t range,
+                         int16_t order,
+                         int16_t density,
+                         int16_t rotate);
+    void fillChanceFx(int16_t fxIndex,
+                      int16_t fillStep,
+                      int16_t chancePercent,
+                      int16_t maxWrites,
+                      int16_t density,
+                      int16_t rotate);
+    void fillRollFx(int16_t fxIndex,
+                    int16_t fillStep,
+                    int16_t probability,
+                    int16_t period,
+                    int16_t density,
+                    int16_t rotate);
+
+    // Instrument written into an empty step by a note fill.  On MIDI/synth
+    // tracks it prefers an instrument already used on that track and only
+    // falls back to changeInstrumentInSpecificOrder().
+    uint8_t getFillInstrumentForTrack(uint8_t track);
+
+    bool isEuclideanStep(uint8_t offset, int16_t density, int16_t rotate);
 
     bool isStepToFillNote(strPattern::strTrack::strStep* step,
                           uint8_t offset,
                           int16_t fillStep,
-                          int16_t density);
+                          int16_t density,
+                          int16_t rotate);
     bool isStepToFillFx(strPattern::strTrack::strStep* step,
                         uint8_t offset,
                         uint8_t fxIndex,
                         int16_t fillStep,
-                        int16_t density);
+                        int16_t density,
+                        int16_t rotate);
     bool isStepToFillProp(strPattern::strTrack::strStep* step,
                           uint8_t offset,
                           bool isPropSet,
                           int16_t fillStep,
-                          int16_t density);
+                          int16_t density,
+                          int16_t rotate);
 
     uint8_t generateRandomFx();
     void invertSelectedSteps(uint8_t);
